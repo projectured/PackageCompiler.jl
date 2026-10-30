@@ -69,6 +69,12 @@ read from the store (`cpu_target`, `sysimage_build_args` are recorded; the
 bundle steps do not run again). `precompile_execution_file` is refused: the
 workload is the one script; `precompile_statements_file` joins the trace.
 
+`track_dependencies = true` adds the sources of every path package of the
+Manifest of `package_dir` to `tracked`, on the founding and on each rebuild:
+the packages that a developer edits beside the application. A rebuild then
+applies an edit of such a package as it applies an edit of the application,
+and a file that joined one of them is tracked from that rebuild on.
+
 Both builds write the reactive image format (`reactive_image = true`, version
 3): one function table in id order, one section per function, and a link with
 `--gc-sections` that drops every function the table does not name. A rebuild
@@ -98,10 +104,14 @@ function materialize_app(package_dir::String, app_dir::String;
                          founding::Bool = get(ENV, "JULIA_REACTIVE_FOUNDING", "") == "1",
                          compact::Tuple{Int, Float64} = _reactive_compact_env(),
                          delta_opt::Int = parse(Int, get(ENV, "JULIA_REACTIVE_DELTA_OPT", "-1")),
+                         track_dependencies::Bool = false,
                          kwargs...)
     trim in (:off, :on, :once) || error("materialize_app: `trim` is :off, :on or :once, not :", trim)
     store = _reactive_store_dir(app_dir)
     if isfile(joinpath(store, REACTIVE_STORE_FILE)) && isfile(_reactive_sysimage(app_dir))
+        track_dependencies &&
+            (tracked = _merge_tracked(isempty(tracked) ? tracked_sources(package_dir) : tracked,
+                                      _dependency_sources(package_dir)))
         image in (:whole, :pages, :overlay) || error("materialize_app: `image` is :whole, :pages or :overlay, not :", image)
         -1 <= delta_opt <= 3 || error("materialize_app: `delta_opt` is 0 to 3, or -1 for the build's level, not ", delta_opt)
         # The garbage of the log: a rebuild appends to the image and never
@@ -133,7 +143,8 @@ function materialize_app(package_dir::String, app_dir::String;
     staging = app_dir * ".founding"
     rm(staging; recursive = true, force = true)
     _materialize_full(package_dir, staging, _reactive_store_dir(staging); trim,
-                      tracked, workload, precompile_statements_file = vcat(precompile_statements_file),
+                      tracked, track_dependencies, workload,
+                      precompile_statements_file = vcat(precompile_statements_file),
                       cpu_target, sysimage_build_args, kwargs...)
     old = app_dir * ".old"
     rm(old; recursive = true, force = true)
@@ -144,13 +155,11 @@ function materialize_app(package_dir::String, app_dir::String;
 end
 
 function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
-                           tracked, workload, precompile_statements_file, cpu_target,
-                           sysimage_build_args, kwargs...)
+                           tracked, track_dependencies::Bool = false, workload,
+                           precompile_statements_file, cpu_target, sysimage_build_args, kwargs...)
     package_dir = abspath(package_dir)
-    files = [abspath(file) for (file, _) in tracked]
-    roots = [root for (_, root) in tracked]
-    for file in files
-        isfile(file) || error("materialize_app: no tracked file $file")
+    for (file, _) in tracked
+        isfile(file) || error("materialize_app: no tracked file $(abspath(file))")
     end
     workload === nothing || isfile(workload) ||
         error("materialize_app: no workload file $workload")
@@ -167,6 +176,10 @@ function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
     # are roots too: `create_app` precompiles them in the founding, and the
     # rebuild must keep them valid.
     Pkg.instantiate(ctx, verbose = true, allow_autoprecomp = false)
+    # The Manifest exists from here on, so the path packages are known.
+    track_dependencies && (tracked = _merge_tracked(tracked, _dependency_sources(package_dir)))
+    files = [abspath(file) for (file, _) in tracked]
+    roots = [root for (_, root) in tracked]
     base_sysimage = unsafe_string(Base.JLOptions().image_file)
     statements = String["precompile(Tuple{typeof($package_name.$julia_main)})"
                         for (_, julia_main) in executables]
@@ -984,19 +997,27 @@ The source files of the package at `package_dir`, each with the dotted name
 of the module whose `include` loads it — the `tracked` list that
 `materialize_app` takes, and the default of a founding.
 
-Read from the package's root file: every literal `include("…")` at the top
-level of a module is a tracked file, evaluated in that module, and a
-`module` block names a deeper module for what it includes. The walk follows
-the included files too.
+Read from the package's root file: every `include` at the top level of a
+module is a tracked file, evaluated in that module, and a `module` block
+names a deeper module for what it includes. The walk follows the included
+files too. The path of an `include` is a string literal, or a path that the
+walk computes without running the package: `@__DIR__`, `@__FILE__`, a
+string, and `joinpath`, `normpath`, `abspath` and `dirname` of those, or
+the name of a `const` of the same module that holds such a path.
 
 The root file comes first, with the empty module path: its top level is the
 `module Pkg … end` block itself, so an `include` or a `using` that joins the
 module body is an edit of a tracked file, and the rebuild applies it or
-refuses it with a reason. An `include` whose argument is not a string
-literal, and one inside a function, are not tracked: the walk names them and
-tracks nothing for them.
+refuses it with a reason. An `include` of another path, and one inside a
+function, are not tracked: the walk names them and tracks nothing for them.
+
+With `dependencies = true` the list also holds the sources of every path
+package of the Manifest of `package_dir`, each in the modules of its own
+package. A file that two modules include is an error: a rebuild could apply
+its edit to one of them only.
 """
-function tracked_sources(package_dir::AbstractString)
+function tracked_sources(package_dir::AbstractString; dependencies::Bool = false)
+    dependencies && return _merge_tracked(tracked_sources(package_dir), _dependency_sources(package_dir))
     project = joinpath(package_dir, "Project.toml")
     isfile(project) || error("tracked_sources: no Project.toml under $package_dir")
     name = get(TOML.parsefile(project), "name", nothing)
@@ -1014,32 +1035,118 @@ _parse_file(file) = Meta.parseall(read(file, String); filename = file)
 # else — a function body, a macro — runs later or never, and is not tracked.
 const _TOPLEVEL_HEADS = (:toplevel, :block, :if, :elseif, :macrocall, :module)
 
-function _walk_includes(expr, file, module_path, tracked)
+# `paths` holds the path constants of the module that the walk is in: the
+# included files of a module share them, and a `module` block starts its own.
+function _walk_includes(expr, file, module_path, tracked, paths = Dict{Symbol, String}())
     expr isa Expr || return
     if expr.head === :call && !isempty(expr.args) && expr.args[1] === :include
-        if length(expr.args) == 2 && expr.args[2] isa AbstractString
-            included = normpath(joinpath(dirname(file), expr.args[2]))
+        path = length(expr.args) == 2 ? _static_path(expr.args[2], file, paths) : nothing
+        if path !== nothing
+            included = normpath(joinpath(dirname(file), path))
             isfile(included) || error("tracked_sources: $file includes $included, " *
                                       "which does not exist")
             if isempty(module_path)
                 @warn "tracked_sources: an include outside every module is not tracked" file included
             else
                 push!(tracked, included => module_path)
-                _walk_includes(_parse_file(included), included, module_path, tracked)
+                _walk_includes(_parse_file(included), included, module_path, tracked, paths)
             end
         else
-            @warn "tracked_sources: an include that is not a string literal is not tracked" file expr
+            @warn "tracked_sources: an include of a path that the walk cannot compute is not tracked" file expr
         end
+        return
+    end
+    if expr.head === :const
+        _record_path_constant!(paths, expr.args[1], file)
         return
     end
     expr.head in _TOPLEVEL_HEADS || return
     if expr.head === :module
         name = String(expr.args[2]::Symbol)
         module_path = isempty(module_path) ? name : module_path * "." * name
+        paths = Dict{Symbol, String}()
     end
     for argument in expr.args
-        _walk_includes(argument, file, module_path, tracked)
+        _walk_includes(argument, file, module_path, tracked, paths)
     end
+end
+
+const _PATH_FUNCTIONS = Dict{Symbol, Function}(:joinpath => joinpath, :normpath => normpath,
+                                               :abspath => abspath, :dirname => dirname)
+
+# The path that `x` gives in `file` without running it, or nothing.
+function _static_path(x, file, paths)
+    x isa AbstractString && return String(x)
+    x isa Symbol && return get(paths, x, nothing)
+    x isa Expr || return nothing
+    if x.head === :macrocall
+        x.args[1] === Symbol("@__DIR__") && return dirname(file)
+        x.args[1] === Symbol("@__FILE__") && return file
+        return nothing
+    end
+    x.head === :call && !isempty(x.args) || return nothing
+    f = get(_PATH_FUNCTIONS, x.args[1], nothing)
+    f === nothing && return nothing
+    parts = String[]
+    for argument in x.args[2:end]
+        part = _static_path(argument, file, paths)
+        part === nothing && return nothing
+        push!(parts, part)
+    end
+    try
+        return f(parts...)::String
+    catch
+        return nothing
+    end
+end
+
+function _record_path_constant!(paths, assignment, file)
+    assignment isa Expr && assignment.head === :(=) && assignment.args[1] isa Symbol || return
+    path = _static_path(assignment.args[2], file, paths)
+    path === nothing || (paths[assignment.args[1]] = path)
+end
+
+# The tracked sources of the path packages of the Manifest of `package_dir`,
+# except the package itself.
+function _dependency_sources(package_dir)
+    package_dir = normpath(abspath(package_dir))
+    manifest = nothing
+    for name in ("JuliaManifest.toml", "Manifest.toml")
+        isfile(joinpath(package_dir, name)) && (manifest = joinpath(package_dir, name); break)
+    end
+    manifest === nothing &&
+        error("tracked_sources: no Manifest.toml under $package_dir; instantiate the package first")
+    data = TOML.parsefile(manifest)
+    haskey(data, "deps") ||
+        error("tracked_sources: $manifest is not of manifest format 2; resolve it with this Julia")
+    found = Pair{String, String}[]
+    for (_, entries) in sort!(collect(data["deps"]); by = first)
+        for entry in entries
+            path = get(entry, "path", nothing)
+            path isa String || continue
+            dir = normpath(joinpath(package_dir, path))
+            rstrip(dir, '/') == rstrip(package_dir, '/') && continue
+            append!(found, tracked_sources(dir))
+        end
+    end
+    return found
+end
+
+# `tracked`, then each pair of `added` whose file `tracked` does not hold.
+function _merge_tracked(tracked, added)
+    merged = Pair{String, String}[tracked...]
+    roots = Dict{String, String}(abspath(file) => root for (file, root) in tracked)
+    for (file, root) in added
+        known = get(roots, abspath(file), nothing)
+        if known === nothing
+            push!(merged, file => root)
+            roots[abspath(file)] = root
+        elseif known != root
+            error("tracked_sources: $file is included by two modules, $(repr(known)) and " *
+                  "$(repr(root)); a rebuild could apply its edit to one of them only")
+        end
+    end
+    return merged
 end
 
 # ── the status and the watch ─────────────────────────────────────────────────
