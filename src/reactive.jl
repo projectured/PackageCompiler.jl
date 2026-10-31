@@ -212,7 +212,7 @@ function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
     _reactive_extract_text(archive, snapshot)
     rm(archive)
     mv(trace, _reactive_trace(store); force = true)
-    _reactive_copy_sources(files, snapshot)
+    _reactive_copy_sources(files, roots, snapshot)
     _reactive_write_reads(files, snapshot)
     config = Dict{String, Any}(
         "package_dir" => package_dir,
@@ -333,25 +333,26 @@ function _reactive_overlay_link(app_dir, archive, id)
     return name
 end
 
-# Put `name` into the chain: in the place of `replaced` when the chain has
-# it (a server's newer overlay), else at the end; the replaced file goes.
-function _reactive_chain_update(app_dir, name, replaced)
+# Make `name` the whole chain: a writer of an overlay starts from the
+# founding image, so its overlay holds every change since the founding. The
+# overlays it replaces go.
+function _reactive_chain_replace(app_dir, name)
     names = _reactive_chain_read(app_dir)
-    index = isempty(replaced) ? nothing : findfirst(==(replaced), names)
-    if index === nothing
-        push!(names, name)
-    else
-        names[index] = name
+    write(_reactive_chain_file(app_dir), name * "\n")
+    for replaced in names
+        replaced == name || rm(joinpath(dirname(_reactive_sysimage(app_dir)), replaced); force = true)
     end
-    open(_reactive_chain_file(app_dir), "w") do io
-        for n in names
-            println(io, n)
-        end
-    end
-    if index !== nothing && replaced != name
-        rm(joinpath(dirname(_reactive_sysimage(app_dir)), replaced); force = true)
-    end
-    return names
+    return nothing
+end
+
+# The founding image under a path of its own: a hard link to the base of the
+# bundle. The runtime reads the chain beside the real path of the image, and
+# this path has none, so a process that loads it has the founding alone.
+function _reactive_founding_image(app_dir, store)
+    path = joinpath(store, "founding." * Libdl.dlext)
+    rm(path; force = true)
+    hardlink(_reactive_sysimage(app_dir), path)
+    return path
 end
 
 # Why the store founds again, or nothing.
@@ -371,16 +372,19 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
     config = data["config"]
     snapshots = sort(data["snapshot"]; by = s -> s["id"])
     id = snapshots[end]["id"] + 1
-    parent = _reactive_snapshot_dir(store, snapshots[end]["id"])
+    session = server ? _reactive_server_ensure(app_dir, store, config, snapshots, image, delta_opt) : nothing
+    # The start: the snapshot whose image the writer loaded, and whose
+    # sources are the old side of the edit. A server's is its last save. An
+    # overlay child loads the founding image: its overlay holds every change
+    # since the founding, and it is the whole chain.
+    start = session !== nothing ? session["last"] : image == :overlay ? snapshots[1]["id"] : snapshots[end]["id"]
+    parent = _reactive_snapshot_dir(store, start)
     snapshot = _reactive_snapshot_dir(store, id)
     mkpath(snapshot)
     sysimage = _reactive_sysimage(app_dir)
-    old_files = String[entry["file"] for entry in config["tracked"]]
-    old_roots = String[entry["root"] for entry in config["tracked"]]
-    old_copies = String[joinpath(parent, "source", string(index, "-", basename(file)))
-                        for (index, file) in enumerate(old_files)]
-    files = isempty(tracked) ? old_files : String[abspath(file) for (file, _) in tracked]
-    roots = isempty(tracked) ? old_roots : String[root for (_, root) in tracked]
+    old_files, old_roots, old_copies = _reactive_read_sources(parent)
+    files = isempty(tracked) ? String[entry["file"] for entry in config["tracked"]] : String[abspath(file) for (file, _) in tracked]
+    roots = isempty(tracked) ? String[entry["root"] for entry in config["tracked"]] : String[root for (_, root) in tracked]
     for file in files
         isfile(file) || error("materialize_app: no tracked file $file")
     end
@@ -397,8 +401,7 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
                                          overrides = _reactive_trim_overrides()))
     archive = joinpath(snapshot, "delta.a")
     next_sysimage = sysimage * ".next"
-    base = snapshots[end]["id"]
-    session = nothing
+    base = session === nothing ? start : session["base"]
     # The overlay of this save (Stage G), linked beside the base; it joins
     # the chain only when the save is complete, below.
     overlay = ""
@@ -406,8 +409,6 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
         # The server loaded the image of its base snapshot; its delta holds
         # every change since, so the link takes the texts of the base chain
         # and the delta.
-        session = _reactive_server_ensure(app_dir, store, config, snapshots, image, delta_opt)
-        base = session["base"]
         spec = joinpath(snapshot, "spec.toml")
         _reactive_write_spec(spec, old_files, old_roots, old_copies, files, roots,
                              joinpath(parent, "reads.txt"), reads, refusal, trace)
@@ -440,7 +441,7 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
                             sysimage_path = next_sysimage,
                             project = config["package_dir"],
                             incremental = true,
-                            base_sysimage = sysimage,
+                            base_sysimage = image == :overlay ? _reactive_founding_image(app_dir, store) : sysimage,
                             cpu_target = config["cpu_target"],
                             script,
                             sysimage_build_args = Cmd(vcat(String.(config["sysimage_build_args"]),
@@ -473,7 +474,7 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
                                         prewritten = !server, overlay = image == :overlay)
         if reason !== nothing
             # The server applied the edit that the trimmer refuses: it stops,
-            # and the next build starts one from the last image. The chain
+            # and the next build starts a new one. The chain
             # and both bundles are as they were: the overlay of this save
             # is not in the chain yet.
             if session !== nothing
@@ -487,16 +488,13 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
         end
     end
     if image == :overlay
-        # The server's overlay is cumulative since its start: it replaces
-        # the one it wrote before in the chain. A child's appends.
-        _reactive_chain_update(app_dir, overlay, session === nothing ? "" : get(session, "overlay", ""))
-        session === nothing || (session["overlay"] = overlay)
+        _reactive_chain_replace(app_dir, overlay)
     else
         mv(next_sysimage, sysimage; force = true)
     end
     trim != :off && _reactive_trim_commit(app_dir, config)
     rm(archive)
-    _reactive_copy_sources(files, snapshot)
+    _reactive_copy_sources(files, roots, snapshot)
     config["tracked"] = [Dict{String, Any}("file" => file, "root" => root)
                          for (file, root) in zip(files, roots)]
     entry = _reactive_entry(id)
@@ -710,33 +708,39 @@ function _reactive_server_ensure(app_dir, store, config, snapshots, image = :who
         if startswith(status, "ok")
             # The memory of the server: the code of every save and every
             # old method version stay until a restart. Past a number of
-            # saves or a resident size the builder restarts it from the
-            # last image, which holds the same state. A server whose last
-            # snapshot is not the last of the store is behind it (a child
-            # build came after): it restarts too.
+            # saves or a resident size the builder restarts it, and the new
+            # server comes to the same state. A server whose last snapshot
+            # is not the last of the store is behind it (a child build came
+            # after): it restarts too.
             saves = parse(Int, something(match(r"saves=(\d+)", status), ["0"])[1])
             rss_kb = parse(Int, something(match(r"rss_kb=(\d+)", status), ["0"])[1])
             max_saves = parse(Int, get(ENV, "JULIA_REACTIVE_SERVER_SAVES", "200"))
             max_rss_kb = parse(Int, get(ENV, "JULIA_REACTIVE_SERVER_RSS_KB", string(16 * 1024 * 1024)))
             last = get(session, "last", session["base"])
+            # An overlay server that did not start from the founding writes
+            # its overlay onto others, and the chain keeps one overlay.
             same_image = get(session, "image", "whole") == string(image) &&
-                         get(session, "delta_opt", -1) == delta_opt
+                         get(session, "delta_opt", -1) == delta_opt &&
+                         (image != :overlay || session["base"] == snapshots[1]["id"])
             if saves < max_saves && rss_kb < max_rss_kb && last == snapshots[end]["id"] && same_image
                 return session
             end
-            @info "materialize_app: the server restarts from the last image" saves rss_kb last latest = snapshots[end]["id"]
+            @info "materialize_app: the server restarts" saves rss_kb last latest = snapshots[end]["id"]
             _reactive_request(session["socket"], "quit"; quiet = true)
         else
             @warn "materialize_app: the server of the store does not answer; a new one starts" session
         end
         rm(session_file; force = true)
     end
-    base = snapshots[end]["id"]
+    # An overlay server starts from the founding image, and its first apply
+    # takes every change since the founding: each save writes the whole
+    # chain. Another server starts from the image of the last snapshot.
+    base = image == :overlay ? snapshots[1]["id"] : snapshots[end]["id"]
     log = joinpath(store, "server.log")
-    sysimage = _reactive_sysimage(app_dir)
+    sysimage = image == :overlay ? _reactive_founding_image(app_dir, store) : _reactive_sysimage(app_dir)
     # The server is the runtime's: `--reactive-server` makes the process
-    # serve on the socket from the image of the last snapshot, in the output
-    # mode of a rebuild child, with the stdlib `ReactiveCompiler` of the image.
+    # serve on the socket from that image, in the output mode of a rebuild
+    # child, with the stdlib `ReactiveCompiler` of the image.
     cmd = with_image_threads(`$(get_julia_cmd()) --cpu-target=$(config["cpu_target"])
         $(Cmd(String.(config["sysimage_build_args"]))) --sysimage=$sysimage
         --project=$(config["package_dir"]) --output-o=$(joinpath(store, "server.a")) --threads=1
@@ -750,7 +754,7 @@ function _reactive_server_ensure(app_dir, store, config, snapshots, image = :who
     end
     time() < deadline || error("materialize_app: the server did not answer within 300 s; see ", log)
     session = Dict{String, Any}("socket" => socket, "base" => base, "last" => base, "pid" => getpid(process),
-                                "image" => string(image), "overlay" => "", "delta_opt" => delta_opt,
+                                "image" => string(image), "delta_opt" => delta_opt,
                                 "started" => Libc.strftime("%Y-%m-%d %H:%M:%S", time()))
     open(session_file, "w") do io
         TOML.print(io, session)
@@ -968,13 +972,33 @@ function server_status(app_dir::String)
     return _reactive_request(session["socket"], "status"; quiet = true)
 end
 
-function _reactive_copy_sources(files, snapshot)
+# The sources of a snapshot: a copy of each tracked file, and `tracked.toml`,
+# the list of the tracked files with their roots. They are the old side of an
+# edit that starts from the snapshot.
+function _reactive_copy_sources(files, roots, snapshot)
     source = joinpath(snapshot, "source")
     mkpath(source)
     for (index, file) in enumerate(files)
-        cp(file, joinpath(source, string(index, "-", basename(file))); force = true)
+        cp(file, _reactive_source_copy(snapshot, index, file); force = true)
+    end
+    open(joinpath(snapshot, "tracked.toml"), "w") do io
+        TOML.print(io, Dict{String, Any}("tracked" => [Dict{String, Any}("file" => file, "root" => root)
+                                                      for (file, root) in zip(files, roots)]))
     end
     return nothing
+end
+
+_reactive_source_copy(snapshot, index, file) = joinpath(snapshot, "source", string(index, "-", basename(file)))
+
+# The tracked files of a snapshot, their roots, and their copies.
+function _reactive_read_sources(snapshot)
+    list = joinpath(snapshot, "tracked.toml")
+    isfile(list) || error("materialize_app: the snapshot $snapshot has no tracked.toml; found the store again")
+    tracked = TOML.parsefile(list)["tracked"]
+    files = String[entry["file"] for entry in tracked]
+    roots = String[entry["root"] for entry in tracked]
+    copies = String[_reactive_source_copy(snapshot, index, file) for (index, file) in enumerate(files)]
+    return files, roots, copies
 end
 
 _reactive_entry(id) = Dict{String, Any}(

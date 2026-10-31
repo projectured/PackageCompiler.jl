@@ -17,11 +17,11 @@ program; the founding traces it in a throwaway process, no build executes
 the program), and one snapshot per build. Every later call is a rebuild: it
 reads the tracked sources from disk, sends the changes to the compiler
 server of the store — a process that keeps the image in memory, started
-with `julia --reactive-server` on the image of the last snapshot — and
-saves the image: an overlay beside the base by default, the edit's code and
-no more. An edit that only a founding can apply (a module option, a new
-dependency, a type that an untracked file names) is refused with the
-reason, and the store stays as it was.
+with `julia --reactive-server` — and saves the image: an overlay beside the
+base by default, the code of the edits since the founding and no more. An
+edit that only a founding can apply (a module option, a new dependency, a
+type that an untracked file names) is refused with the reason, and the
+store stays as it was.
 
 The options of a rebuild are keywords, each with an environment variable as
 its default:
@@ -91,10 +91,11 @@ C-callable entry points, and the build refuses a trimmed image without one.
 
 ## What to know
 
-- Every server that starts appends its overlay to the chain, and the
-  previous generation's stays; after about four starts the growth bound of
-  `compact` is reached and the next build founds again by itself. A gate
-  script that must not found again passes `compact = (1000, 1.0)`.
+- An overlay server starts from the founding image, and its first apply
+  takes every change since the founding. Each save writes the whole chain:
+  one overlay, which replaces the one before. A new server costs the parse
+  and the compile of all these changes again, so the growth bound of
+  `compact` comes only from the edits themselves.
 - A founding builds into `<app_dir>.founding` beside the app and swaps it
   in at the end: a build killed on the way leaves the old app and its store
   as they were, and the next founding clears the staging directory.
