@@ -197,6 +197,12 @@ function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
     trace = tempname() * "-trace.jl"
     write(trace, join(statements, '\n') * "\n")
     archive = tempname() * "-reactive.a"
+    # The founding precompiles the trace through the harness too, so that its
+    # image holds the harness's cache of the resolved statements: a server
+    # that starts from the founding image precompiles the trace by lookups,
+    # with no parse and no evaluation of each statement.
+    harness_script = tempname() * "-founding.jl"
+    write(harness_script, "Base.require(Base.PkgId(Base.UUID($(repr(string(REACTIVE_COMPILER_UUID)))), \"ReactiveCompiler\")).rc_precompile_trace($(repr(trace)))\n")
     # Incremental: the app image grows from the image of this process, the
     # one the trace ran from. The image is written in the reactive format: a
     # rebuild reuses its functions by id and by name, and the link drops the
@@ -206,7 +212,9 @@ function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
                incremental = true, cpu_target,
                sysimage_build_args = Cmd(vcat(String.(sysimage_build_args.exec), ["--reactive-image=whole"])),
                keep_object_archive = archive,
-               precompile_statements_file = trace, reactive_image = true, reactive = false, kwargs...)
+               precompile_statements_file = trace, script = harness_script,
+               reactive_image = true, reactive = false, kwargs...)
+    rm(harness_script)
     snapshot = _reactive_snapshot_dir(store, 1)
     mkpath(snapshot)
     _reactive_extract_text(archive, snapshot)
