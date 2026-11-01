@@ -112,16 +112,8 @@ function materialize_app(package_dir::String, app_dir::String;
         track_dependencies &&
             (tracked = _merge_tracked(isempty(tracked) ? tracked_sources(package_dir) : tracked,
                                       _dependency_sources(package_dir)))
-        image in (:whole, :pages, :overlay) || error("materialize_app: `image` is :whole, :pages or :overlay, not :", image)
-        -1 <= delta_opt <= 3 || error("materialize_app: `delta_opt` is 0 to 3, or -1 for the build's level, not ", delta_opt)
-        # The garbage of the log: a rebuild appends to the image and never
-        # removes; past `compact` saves or growth, or on `founding`, the
-        # store founds again from the tracked files and the workload it
-        # recorded, and the chain starts over.
-        reason = _reactive_compact_reason(app_dir, store, founding, compact)
-        if reason === nothing
-            return _materialize_delta(app_dir, store, tracked; server, trim, image, delta_opt)
-        end
+        reason = _materialize_rebuild(app_dir, store, tracked, founding, compact, server, trim, image, delta_opt)
+        reason === nothing && return app_dir
         config = TOML.parsefile(joinpath(store, REACTIVE_STORE_FILE))["config"]
         isempty(tracked) && (tracked = [String(e["file"]) => String(e["root"]) for e in config["tracked"]])
         workload === nothing && !isempty(get(config, "workload", "")) && (workload = String(config["workload"]))
@@ -142,7 +134,9 @@ function materialize_app(package_dir::String, app_dir::String;
     app_dir = abspath(app_dir)
     staging = app_dir * ".founding"
     rm(staging; recursive = true, force = true)
-    _materialize_full(package_dir, staging, _reactive_store_dir(staging); trim,
+    # A dynamic call: the compile of a rebuild does not infer the founding,
+    # whose `create_app` is large, for the keywords of each caller.
+    Base.invokelatest(_materialize_full, package_dir, staging, _reactive_store_dir(staging); trim,
                       tracked, track_dependencies, workload,
                       precompile_statements_file = vcat(precompile_statements_file),
                       cpu_target, sysimage_build_args, kwargs...)
@@ -152,6 +146,24 @@ function materialize_app(package_dir::String, app_dir::String;
     mv(staging, app_dir)
     rm(old; recursive = true, force = true)
     return app_dir
+end
+
+# The rebuild of a store, or the reason why it founds again. Its arguments
+# are concrete, so that its code is in the package image whatever keywords
+# the caller of `materialize_app` passes.
+function _materialize_rebuild(app_dir::String, store::String, tracked::Vector{Pair{String, String}},
+                              founding::Bool, compact::Tuple{Int, Float64}, server::Bool, trim::Symbol,
+                              image::Symbol, delta_opt::Int)
+    image in (:whole, :pages, :overlay) || error("materialize_app: `image` is :whole, :pages or :overlay, not :", image)
+    -1 <= delta_opt <= 3 || error("materialize_app: `delta_opt` is 0 to 3, or -1 for the build's level, not ", delta_opt)
+    # The garbage of the log: a rebuild appends to the image and never
+    # removes; past `compact` saves or growth, or on `founding`, the store
+    # founds again from the tracked files and the workload it recorded, and
+    # the chain starts over.
+    reason = _reactive_compact_reason(app_dir, store, founding, compact)
+    reason === nothing || return reason
+    _materialize_delta(app_dir, store, tracked; server, trim, image, delta_opt)
+    return nothing
 end
 
 function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
@@ -369,7 +381,7 @@ function _reactive_compact_reason(app_dir, store, founding, compact)
     data = TOML.parsefile(joinpath(store, REACTIVE_STORE_FILE))
     saves = length(data["snapshot"]) - 1
     saves >= compact[1] && return "$saves saves since the founding, the bound is $(compact[1])"
-    growth = _reactive_growth(app_dir, data["config"])
+    growth = _reactive_growth(app_dir, data["config"]::Dict{String, Any})
     growth >= compact[2] && return "the image grew $(round(100 * growth; digits = 1)) % since the founding, the bound is $(round(100 * compact[2]; digits = 1)) %"
     return nothing
 end
@@ -377,8 +389,8 @@ end
 function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim::Symbol = :off,
                             image::Symbol = :whole, delta_opt::Int = -1)
     data = TOML.parsefile(joinpath(store, REACTIVE_STORE_FILE))
-    config = data["config"]
-    snapshots = sort(data["snapshot"]; by = s -> s["id"])
+    config = data["config"]::Dict{String, Any}
+    snapshots = sort(Vector{Any}(data["snapshot"]); by = s -> s["id"])
     id = snapshots[end]["id"] + 1
     session = server ? _reactive_server_ensure(app_dir, store, config, snapshots, image, delta_opt) : nothing
     # The start: the snapshot whose image the writer loaded, and whose
@@ -1287,3 +1299,12 @@ function _changed_files!(stamps::Dict{String,Float64})
     end
     return changed
 end
+
+# The rebuild path in the package image: a build process that rebuilds a
+# store compiles none of it.
+precompile(_materialize_rebuild, (String, String, Vector{Pair{String, String}}, Bool, Tuple{Int, Float64},
+                                  Bool, Symbol, Symbol, Int))
+precompile(tracked_sources, (String,))
+precompile(_dependency_sources, (String,))
+precompile(_merge_tracked, (Vector{Pair{String, String}}, Vector{Pair{String, String}}))
+precompile(stop_server, (String,))
