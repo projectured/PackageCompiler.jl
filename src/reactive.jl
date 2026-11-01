@@ -160,7 +160,7 @@ function _materialize_rebuild(app_dir::String, store::String, tracked::Vector{Pa
     # removes; past `compact` saves or growth, or on `founding`, the store
     # founds again from the tracked files and the workload it recorded, and
     # the chain starts over.
-    reason = _reactive_compact_reason(app_dir, store, founding, compact)
+    reason = _reactive_compact_reason(app_dir, store, founding, compact, image)
     reason === nothing || return reason
     _materialize_delta(app_dir, store, tracked; server, trim, image, delta_opt)
     return nothing
@@ -375,12 +375,15 @@ function _reactive_founding_image(app_dir, store)
     return path
 end
 
-# Why the store founds again, or nothing.
-function _reactive_compact_reason(app_dir, store, founding, compact)
+# Why the store founds again, or nothing. An overlay store holds one overlay
+# of every change since the founding, so its saves do not grow the image, and
+# only the growth counts.
+function _reactive_compact_reason(app_dir, store, founding, compact, image)
     founding && return "founding = true"
     data = TOML.parsefile(joinpath(store, REACTIVE_STORE_FILE))
     saves = length(data["snapshot"]) - 1
-    saves >= compact[1] && return "$saves saves since the founding, the bound is $(compact[1])"
+    image != :overlay && saves >= compact[1] &&
+        return "$saves saves since the founding, the bound is $(compact[1])"
     growth = _reactive_growth(app_dir, data["config"]::Dict{String, Any})
     growth >= compact[2] && return "the image grew $(round(100 * growth; digits = 1)) % since the founding, the bound is $(round(100 * compact[2]; digits = 1)) %"
     return nothing
@@ -521,6 +524,14 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
     entry["base"] = base
     image == :overlay && (entry["overlay"] = overlay)
     push!(data["snapshot"], entry)
+    if image == :overlay
+        # The old side of the next edit is the founding for a new server and
+        # this snapshot for the running one; the snapshots between them go.
+        for earlier in snapshots[2:end]
+            rm(_reactive_snapshot_dir(store, earlier["id"]); recursive = true, force = true)
+        end
+        data["snapshot"] = Any[snapshots[1], entry]
+    end
     _reactive_save(store, data)
     if server
         # The server's state is this snapshot now.

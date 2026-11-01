@@ -33,7 +33,7 @@ its default:
 | `delta_opt` | `JULIA_REACTIVE_DELTA_OPT` | the `-O` level of the edit's code, 0 to 3; -1 the build's |
 | `trim` | `JULIA_REACTIVE_TRIM` | `:off`, `:on`, `:once`: the trimmed product beside the bundle |
 | `founding` | `JULIA_REACTIVE_FOUNDING` | `true` founds the store again now |
-| `compact` | `JULIA_REACTIVE_COMPACT` | `(saves, growth)`: found again after that many saves or that growth |
+| `compact` | `JULIA_REACTIVE_COMPACT` | `(saves, growth)`: found again after that many saves (not for `:overlay`) or that growth |
 
 `create_app` takes `reactive = :auto`: a store under `app_dir` makes the
 build a rebuild through `materialize_app`; `true` founds one when there is
@@ -93,9 +93,11 @@ C-callable entry points, and the build refuses a trimmed image without one.
 
 - An overlay server starts from the founding image, and its first apply
   takes every change since the founding. Each save writes the whole chain:
-  one overlay, which replaces the one before. A new server costs the parse
-  and the compile of all these changes again, so the growth bound of
-  `compact` comes only from the edits themselves.
+  one overlay, which replaces the one before. A new server costs the compile
+  of all these changes again, so the growth bound of `compact` comes only
+  from the edits themselves, and the bound of saves does not apply. The store
+  keeps two snapshots: the founding, where a new server starts, and the last
+  save, where the running server goes on.
 - A founding builds into `<app_dir>.founding` beside the app and swaps it
   in at the end: a build killed on the way leaves the old app and its store
   as they were, and the next founding clears the staging directory.
