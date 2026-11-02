@@ -69,6 +69,11 @@ read from the store (`cpu_target`, `sysimage_build_args` are recorded; the
 bundle steps do not run again). `precompile_execution_file` is refused: the
 workload is the one script; `precompile_statements_file` joins the trace.
 
+`keep_object_archive` names a file where the founding leaves a copy of the
+object archive of its image, for a caller that links the image into a program
+of its own: a rebuild then writes only the overlay and its chain, and the
+program applies them at its start.
+
 `track_dependencies = true` adds the sources of every path package of the
 Manifest of `package_dir` to `tracked`, on the founding and on each rebuild:
 the packages that a developer edits beside the application. A rebuild then
@@ -168,7 +173,8 @@ end
 
 function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
                            tracked, track_dependencies::Bool = false, workload,
-                           precompile_statements_file, cpu_target, sysimage_build_args, kwargs...)
+                           precompile_statements_file, cpu_target, sysimage_build_args,
+                           keep_object_archive::Union{Nothing, String} = nothing, kwargs...)
     package_dir = abspath(package_dir)
     for (file, _) in tracked
         isfile(file) || error("materialize_app: no tracked file $(abspath(file))")
@@ -230,6 +236,12 @@ function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
     snapshot = _reactive_snapshot_dir(store, 1)
     mkpath(snapshot)
     _reactive_extract_text(archive, snapshot)
+    # A caller that links the founding image into a program of its own keeps
+    # the archive of the founding.
+    if keep_object_archive !== nothing
+        mkpath(dirname(abspath(keep_object_archive)))
+        cp(archive, keep_object_archive; force = true)
+    end
     rm(archive)
     mv(trace, _reactive_trace(store); force = true)
     _reactive_copy_sources(files, roots, snapshot)
