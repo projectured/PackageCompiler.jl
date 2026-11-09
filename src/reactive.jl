@@ -147,6 +147,9 @@ function materialize_app(package_dir::String, app_dir::String;
                       cpu_target, sysimage_build_args, kwargs...)
     old = app_dir * ".old"
     rm(old; recursive = true, force = true)
+    # A rebuild during the founding can start a server of the old store; it
+    # stops with that store.
+    stop_server(app_dir)
     ispath(app_dir) && mv(app_dir, old)
     mv(staging, app_dir)
     rm(old; recursive = true, force = true)
@@ -745,6 +748,7 @@ end
 function _reactive_server_ensure(app_dir, store, config, snapshots, image = :whole, delta_opt::Int = -1)
     session_file = _reactive_server_session(store)
     socket = _reactive_server_socket(store)
+    quitting = false
     if isfile(session_file)
         session = TOML.parsefile(session_file)
         status = _reactive_request(session["socket"], "status"; quiet = true)
@@ -770,11 +774,27 @@ function _reactive_server_ensure(app_dir, store, config, snapshots, image = :who
             end
             @info "materialize_app: the server restarts" saves rss_kb last latest = snapshots[end]["id"]
             _reactive_request(session["socket"], "quit"; quiet = true)
+            quitting = true
         else
             @warn "materialize_app: the server of the store does not answer; a new one starts" session
         end
         rm(session_file; force = true)
     end
+    # A server that the session does not name can answer on the socket of
+    # the store: the server of a store that a founding replaced. It quits
+    # too. A quitting server removes its socket path; the build waits for
+    # that and then removes the path itself, so the wait below reaches only
+    # the server that this build starts.
+    if startswith(_reactive_request(socket, "status"; quiet = true), "ok")
+        @warn "materialize_app: a server outside the session answers on the socket of the store; it quits" socket
+        _reactive_request(socket, "quit"; quiet = true)
+        quitting = true
+    end
+    deadline = time() + 10
+    while quitting && ispath(socket) && time() < deadline
+        sleep(0.1)
+    end
+    rm(socket; force = true)
     # An overlay server starts from the founding image, and its first apply
     # takes every change since the founding: each save writes the whole
     # chain. Another server starts from the image of the last snapshot.
@@ -788,7 +808,10 @@ function _reactive_server_ensure(app_dir, store, config, snapshots, image = :who
         $(Cmd(String.(config["sysimage_build_args"]))) --sysimage=$sysimage
         --project=$(config["package_dir"]) --output-o=$(joinpath(store, "server.a")) --threads=1
         $(Cmd(_reactive_flags(image, delta_opt))) --reactive-server=$socket`)
-    process = run(pipeline(detach(cmd); stdout = log, stderr = log); wait = false)
+    # stdout and stderr share one open file, so their writes keep their order.
+    process = open(log, "w") do io
+        run(pipeline(detach(cmd); stdout = io, stderr = io); wait = false)
+    end
     deadline = time() + 300
     while time() < deadline
         ispath(socket) && startswith(_reactive_request(socket, "status"; quiet = true), "ok") && break
@@ -894,7 +917,9 @@ function _reactive_trim_product(app_dir, store, snapshots, base, id, image, sess
             --reactive-reuse --reactive-trim-memo=$(joinpath(store, "trim-memo.txt")) $script`)
         # The founding's pass writes the first memo of the store (see
         # `rc_save` of the server for the memo).
-        ok = success(pipeline(cmd; stdout = log, stderr = log))
+        ok = open(log, "w") do io
+            success(pipeline(cmd; stdout = io, stderr = io))
+        end
         ok && isfile(archive) || return _reactive_trim_reason(log, "the trim child failed; see $log")
     end
     # The chain of the base carries the reused code; the archive carries the
