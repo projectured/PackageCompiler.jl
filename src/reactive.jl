@@ -20,6 +20,59 @@ const REACTIVE_COMPILER_UUID = Base.UUID("1dda119b-71a3-45fb-bd14-d17b1eb16859")
 _reactive_compiler() = Base.require(Base.PkgId(REACTIVE_COMPILER_UUID, "ReactiveCompiler"))
 _reactive_compiler_load() = "const ReactiveCompiler = Base.require(Base.PkgId(Base.UUID(\"1dda119b-71a3-45fb-bd14-d17b1eb16859\"), \"ReactiveCompiler\"))"
 
+# ── the harness that a rebuild runs ─────────────────────────────────────────
+# The image of a store holds the harness of the Julia that founded it. When the
+# harness of this Julia has other sources, a rebuild loads these sources into a
+# module of its own and runs that, so a correction of the harness reaches a
+# store with no founding. The module is no standard library of the process, and
+# the harness deletes its methods before an image is written
+# (`rc_remove_harness!`), so the image holds none of its code.
+
+# The folder of the sources of the harness that a rebuild runs:
+# `JULIA_REACTIVE_HARNESS` names one, else the standard library of this Julia.
+_reactive_harness_dir() =
+    abspath(get(ENV, "JULIA_REACTIVE_HARNESS", joinpath(Sys.STDLIB, "ReactiveCompiler", "src")))
+
+# The print of the sources of a harness: one hash of its `.jl` files, each with
+# its name, as `rc_harness_print` of the harness computes it.
+function _reactive_harness_print(dir::AbstractString)
+    print = zero(UInt)
+    for name in sort!(filter(endswith(".jl"), readdir(dir)))
+        print = hash(read(joinpath(dir, name), String), hash(name, print))
+    end
+    return string(print; base = 16)
+end
+
+# The print of the harness that an image built by this Julia holds: the
+# standard library of the process says it. An older harness does not, and the
+# empty print equals no print of sources, so each rebuild of such a store loads
+# the sources.
+function _reactive_image_harness_print()
+    harness = _reactive_compiler()
+    return isdefined(harness, :HARNESS_PRINT) ? String(harness.HARNESS_PRINT) : ""
+end
+
+# The folder of the sources that a rebuild of the store of `config` loads in
+# place of the harness of its image, or `nothing` when the image holds the
+# harness that the rebuild runs. A store with no record of its harness loads
+# the sources.
+function _reactive_live_harness(config)
+    dir = _reactive_harness_dir()
+    return get(config, "harness", "") == _reactive_harness_print(dir) ? nothing : dir
+end
+
+# The name under which a script of a rebuild holds the harness, and the line
+# that binds it: the standard library of the image, or the sources of
+# `harness` in a module of their own. A script that loads the sources sets the
+# name to `nothing` at its end, because a global of Main stays in the image.
+_reactive_harness_name(harness) = harness === nothing ? "ReactiveCompiler" : "rc_harness"
+_reactive_harness_load(::Nothing) = _reactive_compiler_load()
+_reactive_harness_load(harness::AbstractString) =
+    "rc_harness = let wrapper = Module(:ReactiveHarness)\n" *
+    "    Base.include(wrapper, $(repr(joinpath(harness, "ReactiveCompiler.jl"))))\n" *
+    "    Base.invokelatest(getfield, wrapper, :ReactiveCompiler)\n" *
+    "end"
+
 const REACTIVE_STORE_DIR = "reactive-store"
 const REACTIVE_STORE_FILE = "store.toml"
 const REACTIVE_TRACE_FILE = "trace.jl"
@@ -257,7 +310,10 @@ function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
                       for (file, root) in zip(files, roots)],
         "workload" => workload === nothing ? "" : abspath(workload),
         "executables" => [Any[String(name), String(main)] for (name, main) in executables],
-        "founding_size" => filesize(_reactive_sysimage(app_dir)))
+        "founding_size" => filesize(_reactive_sysimage(app_dir)),
+        # The image holds the harness of the Julia that builds it, whatever
+        # `JULIA_REACTIVE_HARNESS` names for a rebuild.
+        "harness" => _reactive_image_harness_print())
     _reactive_save(store, Dict{String, Any}("config" => config,
                                             "snapshot" => Any[_reactive_entry(1)]))
     @info "materialize_app: the store is founded" store statements = length(statements)
@@ -295,7 +351,7 @@ function refresh_trace(app_dir::String)
     dir = mktempdir()
     kept_file = joinpath(dir, "kept.jl")
     script = joinpath(dir, "refresh.jl")
-    write(script, _reactive_refresh_script(workload, trace, kept_file))
+    write(script, _reactive_refresh_script(workload, trace, kept_file, _reactive_live_harness(config)))
     tracefile = run_precompilation_script(config["package_dir"], _reactive_sysimage(app_dir), script, dir)
     kept = _reactive_roots(_reactive_statements(kept_file))
     new = _reactive_statements(tracefile)
@@ -308,12 +364,12 @@ end
 # The refresh process: the workload first, so that the trace records what the
 # image does not compile; then the old statements, kept when they still
 # precompile from this image.
-function _reactive_refresh_script(workload, trace, kept_file)
+function _reactive_refresh_script(workload, trace, kept_file, harness = nothing)
     io = IOBuffer()
     println(io, "# generated by PackageCompiler.refresh_trace — the trace child")
     println(io, "include($(repr(workload)))")
-    println(io, _reactive_compiler_load())
-    println(io, "ReactiveCompiler.rc_keep_statements($(repr(trace)), $(repr(kept_file)))")
+    println(io, _reactive_harness_load(harness))
+    println(io, "$(_reactive_harness_name(harness)).rc_keep_statements($(repr(trace)), $(repr(kept_file)))")
     return String(take!(io))
 end
 
@@ -436,7 +492,8 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
     write(script, _reactive_child_script(old_files, _reactive_paths(old_roots), old_copies,
                                          files, _reactive_paths(roots), old_reads, reads, refusal, trace;
                                          trim = !server && trim != :off, trimmed = trimmed_archive,
-                                         overrides = _reactive_trim_overrides()))
+                                         overrides = _reactive_trim_overrides(),
+                                         harness = _reactive_live_harness(config)))
     archive = joinpath(snapshot, "delta.a")
     next_sysimage = sysimage * ".next"
     base = session === nothing ? start : session["base"]
@@ -566,20 +623,22 @@ _reactive_paths(roots) = Vector{Symbol}[isempty(root) ? Symbol[] : Symbol.(split
 # The top level of the rebuild child. Everything that varies is a literal
 # here; the function bodies are the stdlib's, compiled in the image.
 function _reactive_child_script(old_files, old_roots, old_copies, files, roots, old_reads,
-                                reads, refusal, trace; trim::Bool = false, trimmed = "", overrides = "")
+                                reads, refusal, trace; trim::Bool = false, trimmed = "", overrides = "",
+                                harness = nothing)
     io = IOBuffer()
+    rc = _reactive_harness_name(harness)
     println(io, "# generated by PackageCompiler.materialize_app — the rebuild child")
-    println(io, _reactive_compiler_load())
+    println(io, _reactive_harness_load(harness))
     println(io, "rc_state = try")
-    println(io, "    ReactiveCompiler.rc_apply_tracked($(repr(old_files)), $(repr(old_roots)), $(repr(old_copies)),")
+    println(io, "    $rc.rc_apply_tracked($(repr(old_files)), $(repr(old_roots)), $(repr(old_copies)),")
     println(io, "                     $(repr(files)), $(repr(roots)),")
     println(io, "                     $(repr(old_reads)), $(repr(reads)), $(repr(refusal)))")
     println(io, "catch e")
-    println(io, "    e isa ReactiveCompiler.RcRefusal || rethrow()")
+    println(io, "    e isa $rc.RcRefusal || rethrow()")
     println(io, "    exit(3)")
     println(io, "end")
-    println(io, "ReactiveCompiler.rc_precompile_trace($(repr(trace)))")
-    println(io, "ReactiveCompiler.rc_report_new(rc_state)")
+    println(io, "$rc.rc_precompile_trace($(repr(trace)))")
+    println(io, "$rc.rc_report_new(rc_state)")
     # A global of Main stays in the image: the set of every method instance
     # would root the dead ones.
     println(io, "rc_state = nothing")
@@ -591,7 +650,7 @@ function _reactive_child_script(old_files, old_roots, old_copies, files, roots, 
         # refusal file with the id T1 and exits, and the builder rolls back.
         println(io, "let ok = false")
         println(io, "    try")
-        println(io, "        ReactiveCompiler.rc_save($(repr(trimmed)); trim = true, overrides = $(repr(overrides)))")
+        println(io, "        $rc.rc_save($(repr(trimmed)); trim = true, overrides = $(repr(overrides)))")
         println(io, "        ok = isfile($(repr(trimmed)))")
         println(io, "    catch e")
         println(io, "        Base.showerror(stderr, e, catch_backtrace()); println(stderr)")
@@ -608,6 +667,30 @@ function _reactive_child_script(old_files, old_roots, old_copies, files, roots, 
         println(io, "    end")
         println(io, "end")
     end
+    if harness !== nothing
+        # The exit of the child writes the image: the methods of the loaded
+        # harness go first, and the name of it in Main after them.
+        println(io, "$rc.rc_remove_harness!()")
+        println(io, "$rc = nothing")
+    end
+    return String(take!(io))
+end
+
+# The program of a server that loads the sources of `harness`: the server of
+# the image is the entry `--reactive-server` of its Julia, which serves with the
+# harness of the image. The process runs in the output mode of a rebuild, which
+# runs no `__init__`, so the program opens the standard streams before it
+# loads a source: the streams of the image are those of the process that wrote
+# it.
+function _reactive_server_script(harness::AbstractString, socket::AbstractString)
+    io = IOBuffer()
+    println(io, "# generated by PackageCompiler.materialize_app — the compiler server, with the harness of $harness")
+    println(io, "Base.reinit_stdio()")
+    println(io, "Base.exit_on_sigint(true)")
+    println(io, "let wrapper = Module(:ReactiveHarness)")
+    println(io, "    Base.include(wrapper, $(repr(joinpath(harness, "ReactiveCompiler.jl"))))")
+    println(io, "    Base.invokelatest(Base.invokelatest(getfield, Base.invokelatest(getfield, wrapper, :ReactiveCompiler), :serve), $(repr(String(socket))))")
+    println(io, "end")
     return String(take!(io))
 end
 
@@ -766,9 +849,12 @@ function _reactive_server_ensure(app_dir, store, config, snapshots, image = :who
             last = get(session, "last", session["base"])
             # An overlay server that did not start from the founding writes
             # its overlay onto others, and the chain keeps one overlay.
+            # A server runs the harness that it loaded at its start: after a
+            # change of the sources of the harness a new server starts.
             same_image = get(session, "image", "whole") == string(image) &&
                          get(session, "delta_opt", -1) == delta_opt &&
-                         (image != :overlay || session["base"] == snapshots[1]["id"])
+                         (image != :overlay || session["base"] == snapshots[1]["id"]) &&
+                         get(session, "harness", "") == _reactive_harness_print(_reactive_harness_dir())
             if saves < max_saves && rss_kb < max_rss_kb && last == snapshots[end]["id"] && same_image
                 return session
             end
@@ -804,10 +890,22 @@ function _reactive_server_ensure(app_dir, store, config, snapshots, image = :who
     # The server is the runtime's: `--reactive-server` makes the process
     # serve on the socket from that image, in the output mode of a rebuild
     # child, with the stdlib `ReactiveCompiler` of the image.
+    # A store whose image holds another harness than this Julia has gets a
+    # server that loads the sources of the harness: the same process, with a
+    # program in place of the entry.
+    harness = _reactive_live_harness(config)
+    entry = if harness === nothing
+        `--reactive-server=$socket`
+    else
+        program = joinpath(store, "serve.jl")
+        write(program, _reactive_server_script(harness, socket))
+        @info "materialize_app: the server loads the harness of this Julia, which the image of the store does not hold" harness
+        `$program`
+    end
     cmd = with_image_threads(`$(get_julia_cmd()) --cpu-target=$(config["cpu_target"])
         $(Cmd(String.(config["sysimage_build_args"]))) --sysimage=$sysimage
         --project=$(config["package_dir"]) --output-o=$(joinpath(store, "server.a")) --threads=1
-        $(Cmd(_reactive_flags(image, delta_opt))) --reactive-server=$socket`)
+        $(Cmd(_reactive_flags(image, delta_opt))) $entry`)
     # stdout and stderr share one open file, so their writes keep their order.
     process = open(log, "w") do io
         run(pipeline(detach(cmd); stdout = io, stderr = io); wait = false)
@@ -821,6 +919,7 @@ function _reactive_server_ensure(app_dir, store, config, snapshots, image = :who
     time() < deadline || error("materialize_app: the server did not answer within 300 s; see ", log)
     session = Dict{String, Any}("socket" => socket, "base" => base, "last" => base, "pid" => getpid(process),
                                 "image" => string(image), "delta_opt" => delta_opt,
+                                "harness" => _reactive_harness_print(_reactive_harness_dir()),
                                 "started" => Libc.strftime("%Y-%m-%d %H:%M:%S", time()))
     open(session_file, "w") do io
         TOML.print(io, session)
