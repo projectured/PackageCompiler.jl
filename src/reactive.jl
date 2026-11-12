@@ -209,6 +209,48 @@ function materialize_app(package_dir::String, app_dir::String;
     return app_dir
 end
 
+# The inputs of a store outside its tracked sources, each by its name with a
+# print: the build of Julia, the project file, the Manifest entry of each
+# package, the preferences files, the workload and the statements files. A
+# whole build reads them, and a rebuild reads none of them, so a rebuild whose
+# input differs would keep the input of before in its image.
+function _reactive_inputs(package_dir::String, workload::String, statements_files::Vector{String})
+    inputs = Dict{String, String}()
+    print_of(text) = string(hash(text); base = 16)
+    inputs["the build of Julia"] = string(VERSION, " ", Base.GIT_VERSION_INFO.commit)
+    project = Base.env_project_file(package_dir)
+    if project isa String
+        inputs["the project file"] = print_of(read(project, String))
+        manifest = Base.project_file_manifest_path(project)
+        if manifest !== nothing && isfile(manifest)
+            for (name, entries) in get(TOML.parsefile(manifest), "deps", Dict{String, Any}())
+                entry = sprint(io -> TOML.print(io, Dict{String, Any}(name => entries); sorted = true))
+                inputs[string("the Manifest entry of ", name)] = print_of(entry)
+            end
+        end
+        for name in ("LocalPreferences.toml", "JuliaLocalPreferences.toml")
+            file = joinpath(dirname(project), name)
+            isfile(file) && (inputs[string("the preferences file ", name)] = print_of(read(file, String)))
+        end
+    end
+    isempty(workload) || (inputs["the workload"] = isfile(workload) ? print_of(read(workload, String)) : "no file")
+    for file in statements_files
+        inputs[string("the statements file ", file)] = isfile(file) ? print_of(read(file, String)) : "no file"
+    end
+    return inputs
+end
+
+# The names of the inputs that differ from those of the whole build of the
+# store, in order. A store of before the record has none.
+function _reactive_changed_inputs(config)
+    recorded = get(config, "inputs", nothing)
+    recorded === nothing && return String[]
+    now = _reactive_inputs(String(config["package_dir"]), String(get(config, "workload", "")),
+                           String[String(file) for file in get(config, "statements_files", String[])])
+    return sort!(String[name for name in union(keys(recorded), keys(now))
+                        if get(recorded, name, "") != get(now, name, "")])
+end
+
 # The rebuild of a store, or the reason why it founds again. Its arguments
 # are concrete, so that its code is in the package image whatever keywords
 # the caller of `materialize_app` passes.
@@ -223,6 +265,11 @@ function _materialize_rebuild(app_dir::String, store::String, tracked::Vector{Pa
     # the chain starts over.
     reason = _reactive_compact_reason(app_dir, store, founding, compact, image)
     reason === nothing || return reason
+    changed = _reactive_changed_inputs(TOML.parsefile(joinpath(store, REACTIVE_STORE_FILE))["config"])
+    isempty(changed) ||
+        error("materialize_app: an input of the store changed: ", join(changed, ", "),
+              ". The image holds the input of its whole build, and a rebuild applies the tracked sources only. ",
+              "Pass `founding = true` (the option `--found` of the build scripts) for a whole build with the input of now.")
     _materialize_delta(app_dir, store, tracked; server, trim, image, delta_opt)
     return nothing
 end
@@ -254,6 +301,15 @@ function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
     track_dependencies && (tracked = _merge_tracked(tracked, _dependency_sources(package_dir)))
     files = [abspath(file) for (file, _) in tracked]
     roots = [root for (_, root) in tracked]
+    # The copy of the sources is taken before the build loads them: an edit
+    # that arrives during the build is then a change for the first rebuild. A
+    # copy taken after the build would hold a text that the image does not.
+    # `create_app` clears `app_dir`, so the copy waits outside it.
+    early = mktempdir()
+    _reactive_copy_sources(files, roots, early)
+    _reactive_write_reads(files, early)
+    statements_files = String[abspath(file) for file in precompile_statements_file]
+    inputs = _reactive_inputs(package_dir, workload === nothing ? "" : abspath(workload), statements_files)
     base_sysimage = unsafe_string(Base.JLOptions().image_file)
     statements = String["precompile(Tuple{typeof($package_name.$julia_main)})"
                         for (_, julia_main) in executables]
@@ -300,8 +356,10 @@ function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
     end
     rm(archive)
     mv(trace, _reactive_trace(store); force = true)
-    _reactive_copy_sources(files, roots, snapshot)
-    _reactive_write_reads(files, snapshot)
+    for name in readdir(early)
+        mv(joinpath(early, name), joinpath(snapshot, name); force = true)
+    end
+    rm(early; recursive = true, force = true)
     config = Dict{String, Any}(
         "package_dir" => package_dir,
         "cpu_target" => cpu_target,
@@ -309,6 +367,8 @@ function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
         "tracked" => [Dict{String, Any}("file" => file, "root" => root)
                       for (file, root) in zip(files, roots)],
         "workload" => workload === nothing ? "" : abspath(workload),
+        "statements_files" => statements_files,
+        "inputs" => inputs,
         "executables" => [Any[String(name), String(main)] for (name, main) in executables],
         "founding_size" => filesize(_reactive_sysimage(app_dir)),
         # The image holds the harness of the Julia that builds it, whatever
@@ -482,6 +542,10 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
     for file in files
         isfile(file) || error("materialize_app: no tracked file $file")
     end
+    # The copy of the sources is taken before the rebuild reads them: an edit
+    # that arrives during the rebuild is then a change for the next one. A
+    # copy taken after it would hold a text that the image does not.
+    _reactive_copy_sources(files, roots, snapshot)
     old_reads = _reactive_read_reads(joinpath(parent, "reads.txt"))
     reads = joinpath(snapshot, "reads.txt")
     refusal = joinpath(snapshot, "refusal.txt")
@@ -589,7 +653,6 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
     end
     trim != :off && _reactive_trim_commit(app_dir, config)
     rm(archive)
-    _reactive_copy_sources(files, roots, snapshot)
     config["tracked"] = [Dict{String, Any}("file" => file, "root" => root)
                          for (file, root) in zip(files, roots)]
     entry = _reactive_entry(id)
