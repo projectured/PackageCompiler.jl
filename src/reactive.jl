@@ -213,40 +213,49 @@ function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
         append!(statements, _reactive_statements(file))
     end
     statements = _reactive_roots(statements)
-    # `create_app` clears `app_dir`, so the archive and the trace land outside
-    # it and the store is founded after the build.
-    trace = tempname() * "-trace.jl"
-    write(trace, join(statements, '\n') * "\n")
-    archive = tempname() * "-reactive.a"
-    # The founding precompiles the trace through the harness too, so that its
-    # image holds the harness's cache of the resolved statements: a server
-    # that starts from the founding image precompiles the trace by lookups,
-    # with no parse and no evaluation of each statement.
-    harness_script = tempname() * "-founding.jl"
-    write(harness_script, "Base.require(Base.PkgId(Base.UUID($(repr(string(REACTIVE_COMPILER_UUID)))), \"ReactiveCompiler\")).rc_precompile_trace($(repr(trace)))\n")
-    # Incremental: the app image grows from the image of this process, the
-    # one the trace ran from. The image is written in the reactive format: a
-    # rebuild reuses its functions by id and by name, and the link drops the
-    # functions that lost their id.
-    # The founding writes whole, whatever the environment of a gate says.
-    create_app(package_dir, app_dir;
-               incremental = true, cpu_target,
-               sysimage_build_args = Cmd(vcat(String.(sysimage_build_args.exec), ["--reactive-image=whole"])),
-               keep_object_archive = archive,
-               precompile_statements_file = trace, script = harness_script,
-               reactive_image = true, reactive = false, kwargs...)
-    rm(harness_script)
+    # `create_app` clears `app_dir`, so the trace, the archive and the harness
+    # script land in a folder of their own, and the store is founded after the
+    # build. The folder goes away when the founding ends, also when it fails.
+    work = mktempdir()
+    trace = joinpath(work, REACTIVE_TRACE_FILE)
+    archive = joinpath(work, "reactive.a")
+    harness_script = joinpath(work, "founding.jl")
     snapshot = _reactive_snapshot_dir(store, 1)
-    mkpath(snapshot)
-    _reactive_extract_text(archive, snapshot)
-    # A caller that links the founding image into a program of its own keeps
-    # the archive of the founding.
-    if keep_object_archive !== nothing
-        mkpath(dirname(abspath(keep_object_archive)))
-        cp(archive, keep_object_archive; force = true)
+    try
+        write(trace, join(statements, '\n') * "\n")
+        # The founding precompiles the trace through the harness too, so that its
+        # image holds the harness's cache of the resolved statements: a server
+        # that starts from the founding image precompiles the trace by lookups,
+        # with no parse and no evaluation of each statement.
+        write(harness_script, "Base.require(Base.PkgId(Base.UUID($(repr(string(REACTIVE_COMPILER_UUID)))), \"ReactiveCompiler\")).rc_precompile_trace($(repr(trace)))\n")
+        # Incremental: the app image grows from the image of this process, the
+        # one the trace ran from. The image is written in the reactive format: a
+        # rebuild reuses its functions by id and by name, and the link drops the
+        # functions that lost their id.
+        # The founding writes whole, whatever the environment of a gate says.
+        create_app(package_dir, app_dir;
+                   incremental = true, cpu_target,
+                   sysimage_build_args = Cmd(vcat(String.(sysimage_build_args.exec), ["--reactive-image=whole"])),
+                   keep_object_archive = archive,
+                   precompile_statements_file = trace, script = harness_script,
+                   reactive_image = true, reactive = false, kwargs...)
+        mkpath(snapshot)
+        _reactive_extract_text(archive, snapshot)
+        # A caller that links the founding image into a program of its own keeps
+        # the archive of the founding.
+        if keep_object_archive !== nothing
+            mkpath(dirname(abspath(keep_object_archive)))
+            cp(archive, keep_object_archive; force = true)
+        end
+        # The harness writes the statements that did not resolve beside the
+        # trace, as a rebuild does in the store; the listing goes with the trace.
+        mv(trace, _reactive_trace(store); force = true)
+        listing = trace * ".unresolved"
+        stored_listing = _reactive_trace(store) * ".unresolved"
+        isfile(listing) ? mv(listing, stored_listing; force = true) : rm(stored_listing; force = true)
+    finally
+        rm(work; recursive = true, force = true)
     end
-    rm(archive)
-    mv(trace, _reactive_trace(store); force = true)
     _reactive_copy_sources(files, roots, snapshot)
     _reactive_write_reads(files, snapshot)
     config = Dict{String, Any}(
