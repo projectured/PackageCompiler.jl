@@ -240,6 +240,23 @@ function _reactive_inputs(package_dir::String, workload::String, statements_file
     return inputs
 end
 
+# The optimization level that the build arguments name: the last `-O<n>` or
+# `--optimize=<n>`, a bare `-O` is 3, and 2 with none.
+function _reactive_opt_level(args)
+    level = 2
+    for arg in args
+        text = String(arg)
+        if text == "-O" || text == "--optimize"
+            level = 3
+        elseif startswith(text, "-O") && length(text) == 3 && isdigit(text[3])
+            level = parse(Int, text[3:3])
+        elseif startswith(text, "--optimize=") && length(text) == 12 && isdigit(text[12])
+            level = parse(Int, text[12:12])
+        end
+    end
+    return level
+end
+
 # The names of the inputs that differ from those of the whole build of the
 # store, in order. A store of before the record has none.
 function _reactive_changed_inputs(config)
@@ -265,7 +282,14 @@ function _materialize_rebuild(app_dir::String, store::String, tracked::Vector{Pa
     # the chain starts over.
     reason = _reactive_compact_reason(app_dir, store, founding, compact, image)
     reason === nothing || return reason
-    changed = _reactive_changed_inputs(TOML.parsefile(joinpath(store, REACTIVE_STORE_FILE))["config"])
+    config = TOML.parsefile(joinpath(store, REACTIVE_STORE_FILE))["config"]
+    # The code of a rebuild has the level of the whole build, unless
+    # `delta_opt` or JULIA_REACTIVE_DELTA_OPT names another one: a variable
+    # that a shell kept must not lower the code with no word of it.
+    whole_opt = _reactive_opt_level(config["sysimage_build_args"])
+    delta_opt >= 0 && delta_opt != whole_opt &&
+        @info "materialize_app: the rebuild compiles its code at another level than the whole build" rebuild = "-O$delta_opt" whole_build = "-O$whole_opt"
+    changed = _reactive_changed_inputs(config)
     isempty(changed) ||
         error("materialize_app: an input of the store changed: ", join(changed, ", "),
               ". The image holds the input of its whole build, and a rebuild applies the tracked sources only. ",
@@ -967,7 +991,7 @@ function _reactive_server_ensure(app_dir, store, config, snapshots, image = :who
     end
     cmd = with_image_threads(`$(get_julia_cmd()) --cpu-target=$(config["cpu_target"])
         $(Cmd(String.(config["sysimage_build_args"]))) --sysimage=$sysimage
-        --project=$(config["package_dir"]) --output-o=$(joinpath(store, "server.a")) --threads=1
+        --project=$(config["package_dir"]) --output-o=$(joinpath(store, "server.a")) --threads=1 --gcthreads=1
         $(Cmd(_reactive_flags(image, delta_opt))) $entry`)
     # stdout and stderr share one open file, so their writes keep their order.
     process = open(log, "w") do io
