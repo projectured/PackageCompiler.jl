@@ -431,6 +431,11 @@ function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
                precompile_statements_file = trace, script = harness_script,
                reactive_image = true, reactive = false, kwargs...)
     rm(harness_script)
+    # The statements that did not compile in the whole build, which the harness
+    # listed beside the trace: a rebuild counts the ones that it loses against
+    # them.
+    founding_lost = _reactive_count_lines(trace * ".unresolved")
+    rm(trace * ".unresolved"; force = true)
     snapshot = _reactive_snapshot_dir(store, 1)
     mkpath(snapshot)
     _reactive_extract_text(archive, snapshot)
@@ -466,6 +471,7 @@ function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
         "inputs" => inputs,
         "executables" => [Any[String(name), String(main)] for (name, main) in executables],
         "founding_size" => filesize(_reactive_sysimage(app_dir)),
+        "founding_lost" => founding_lost,
         # The image holds the harness of the Julia that builds it, whatever
         # `JULIA_REACTIVE_HARNESS` names for a rebuild.
         "harness" => _reactive_image_harness_print())
@@ -780,8 +786,25 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
         _reactive_write_session(store, session)
     end
     growth = round(100 * _reactive_growth(app_dir, config); digits = 2)
-    @info "materialize_app: snapshot s$id materialized" seconds = round(elapsed; digits = 1) server trim image growth_percent = growth
+    lost = _reactive_count_lines(_reactive_trace(store) * ".unresolved")
+    @info "materialize_app: snapshot s$id materialized" seconds = round(elapsed; digits = 1) server trim image growth_percent = growth lost_statements = lost
+    _reactive_report_lost(app_dir, store, lost, get(config, "founding_lost", 0))
     return app_dir
+end
+
+# The count of the lines of a file, 0 for no file.
+_reactive_count_lines(path) = isfile(path) ? count(!isempty, eachline(path)) : 0
+
+# Say it when the statements of the trace that do not compile are more than at
+# the whole build. The image then holds no compiled code for those calls, and
+# the program compiles each one when it runs it. A new recording of the
+# workload (`refresh_trace`, then a rebuild) gives the image the calls of the
+# code of now; a person starts it, when the program is slow enough to need it.
+function _reactive_report_lost(app_dir, store, lost::Int, founding_lost::Int)
+    lost > founding_lost || return nothing
+    listing = _reactive_trace(store) * ".unresolved"
+    @info "materialize_app: $(lost - founding_lost) statements of the trace do not compile since the edits; the program compiles those calls when it runs them. `refresh_trace` records the workload again, and the next rebuild compiles what it records" listing app_dir
+    return nothing
 end
 
 # The module path of a dotted root: the empty path for the root file.
