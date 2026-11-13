@@ -211,10 +211,13 @@ end
 
 # The inputs of a store outside its tracked sources, each by its name with a
 # print: the build of Julia, the project file, the Manifest entry of each
-# package, the preferences files, the workload and the statements files. A
-# whole build reads them, and a rebuild reads none of them, so a rebuild whose
-# input differs would keep the input of before in its image.
-function _reactive_inputs(package_dir::String, workload::String, statements_files::Vector{String})
+# package, the preferences files, the workload, the statements files, and the
+# source files that the walk of the includes does not track (`untracked`, see
+# `_reactive_untracked_sources`). A whole build reads them, and a rebuild
+# reads none of them, so a rebuild whose input differs would keep the input of
+# before in its image.
+function _reactive_inputs(package_dir::String, workload::String, statements_files::Vector{String},
+                          untracked::Vector{String} = String[])
     inputs = Dict{String, String}()
     print_of(text) = string(hash(text); base = 16)
     inputs["the build of Julia"] = string(VERSION, " ", Base.GIT_VERSION_INFO.commit)
@@ -237,7 +240,65 @@ function _reactive_inputs(package_dir::String, workload::String, statements_file
     for file in statements_files
         inputs[string("the statements file ", file)] = isfile(file) ? print_of(read(file, String)) : "no file"
     end
+    for file in untracked
+        inputs[_reactive_untracked_name(file)] =
+            isfile(file) ? _reactive_source_print(filesize(file), open(Base._crc32c, file, "r")) : "no file"
+    end
     return inputs
+end
+
+_reactive_untracked_name(file) = string("the source file ", file, ", which the build does not track")
+
+# The print of a source file as the cache of its package holds it: the size
+# and the checksum of the text that Julia loaded.
+_reactive_source_print(size, checksum) = string(size, " ", string(checksum; base = 16))
+
+# The folders of the packages whose sources a person edits: the package of the
+# build, and each package that its Manifest names by a path.
+function _reactive_path_package_dirs(package_dir::String)
+    dirs = String[rstrip(normpath(abspath(package_dir)), '/')]
+    project = Base.env_project_file(package_dir)
+    manifest = project isa String ? Base.project_file_manifest_path(project) : nothing
+    manifest !== nothing && isfile(manifest) || return dirs
+    for (_, entries) in get(TOML.parsefile(manifest), "deps", Dict{String, Any}()), entry in entries
+        path = get(entry, "path", nothing)
+        path isa String && push!(dirs, rstrip(normpath(joinpath(dirname(manifest), path)), '/'))
+    end
+    return unique!(dirs)
+end
+
+# The source files that the image of `app_dir` was made from and that the
+# build does not track, each with its print. The walk of the includes reads
+# the text of a file, so it tracks no file whose path the text computes: an
+# `include` in a loop, a path from a function, an `include` with a function of
+# its expressions. Julia records each file that a package included in the
+# header of the cache of the package, with its size and its checksum, and the
+# image names that cache. A process on the image reads the headers. A package
+# in a depot is no source that a person edits, so only the packages of
+# `_reactive_path_package_dirs` count.
+function _reactive_untracked_sources(app_dir::String, package_dir::String, tracked_files::Vector{String})
+    code = """
+        for (id, origin) in Base.pkgorigins
+            root, cache = origin.path, origin.cachepath
+            root isa String && cache isa String && isfile(cache) || continue
+            for file in Base.parse_cache_header(cache)[2][2]
+                println(root, '\\t', file.filename, '\\t', file.fsize, '\\t', file.hash)
+            end
+        end
+        """
+    lines = readlines(`$(get_julia_cmd()) --startup-file=no --sysimage=$(_reactive_sysimage(app_dir)) -e $code`)
+    dirs = _reactive_path_package_dirs(package_dir)
+    tracked = Set{String}(realpath(file) for file in tracked_files)
+    untracked = Dict{String, String}()
+    for line in lines
+        parts = split(line, '\t')
+        length(parts) == 4 || continue
+        root, file = String(parts[1]), String(parts[2])
+        any(dir -> startswith(root, dir * "/"), dirs) || continue
+        ispath(file) && realpath(file) in tracked && continue
+        untracked[file] = _reactive_source_print(parse(UInt64, parts[3]), parse(UInt32, parts[4]))
+    end
+    return untracked
 end
 
 # The optimization level that the build arguments name: the last `-O<n>` or
@@ -263,7 +324,8 @@ function _reactive_changed_inputs(config)
     recorded = get(config, "inputs", nothing)
     recorded === nothing && return String[]
     now = _reactive_inputs(String(config["package_dir"]), String(get(config, "workload", "")),
-                           String[String(file) for file in get(config, "statements_files", String[])])
+                           String[String(file) for file in get(config, "statements_files", String[])],
+                           String[String(file) for file in get(config, "untracked", String[])])
     return sort!(String[name for name in union(keys(recorded), keys(now))
                         if get(recorded, name, "") != get(now, name, "")])
 end
@@ -384,6 +446,14 @@ function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
         mv(joinpath(early, name), joinpath(snapshot, name); force = true)
     end
     rm(early; recursive = true, force = true)
+    # The files that the image holds and that no rebuild reads are inputs,
+    # with the print of the text that the build loaded.
+    untracked = _reactive_untracked_sources(app_dir, package_dir, files)
+    for (file, print) in untracked
+        inputs[_reactive_untracked_name(file)] = print
+    end
+    isempty(untracked) ||
+        @info "materialize_app: the build does not track some source files; a rebuild stops when one of them changes" files = sort!(collect(keys(untracked)))
     config = Dict{String, Any}(
         "package_dir" => package_dir,
         "cpu_target" => cpu_target,
@@ -392,6 +462,7 @@ function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
                       for (file, root) in zip(files, roots)],
         "workload" => workload === nothing ? "" : abspath(workload),
         "statements_files" => statements_files,
+        "untracked" => sort!(collect(keys(untracked))),
         "inputs" => inputs,
         "executables" => [Any[String(name), String(main)] for (name, main) in executables],
         "founding_size" => filesize(_reactive_sysimage(app_dir)),
@@ -595,8 +666,18 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
         spec = joinpath(snapshot, "spec.toml")
         _reactive_write_spec(spec, old_files, old_roots, old_copies, files, roots,
                              joinpath(parent, "reads.txt"), reads, refusal, trace)
+        # From the apply on, the server holds an edit that the store names
+        # only at the end of this build. The session says so until then: a
+        # build that ends in between, by an error of the link or by a signal,
+        # leaves the mark, and the next build starts a new server from the
+        # last snapshot that the store names (`_reactive_server_ensure`).
+        session["pending"] = id
+        _reactive_write_session(store, session)
         reply = _reactive_request(session["socket"], "apply " * spec)
         if startswith(reply, "refused")
+            # A refused apply left the server as it was.
+            delete!(session, "pending")
+            _reactive_write_session(store, session)
             reasons = isfile(refusal) ? read(refusal, String) : reply
             rm(snapshot; recursive = true, force = true)
             error("materialize_app: the rebuild is refused; a founding build applies the change:\n", reasons)
@@ -693,11 +774,10 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
     end
     _reactive_save(store, data)
     if server
-        # The server's state is this snapshot now.
+        # The server's state is this snapshot now, and the store names it.
         session["last"] = id
-        open(_reactive_server_session(store), "w") do io
-            TOML.print(io, session)
-        end
+        delete!(session, "pending")
+        _reactive_write_session(store, session)
     end
     growth = round(100 * _reactive_growth(app_dir, config); digits = 2)
     @info "materialize_app: snapshot s$id materialized" seconds = round(elapsed; digits = 1) server trim image growth_percent = growth
@@ -938,14 +1018,18 @@ function _reactive_server_ensure(app_dir, store, config, snapshots, image = :who
             # its overlay onto others, and the chain keeps one overlay.
             # A server runs the harness that it loaded at its start: after a
             # change of the sources of the harness a new server starts.
+            # A server with a pending snapshot holds an edit of a build that
+            # ended before the store named it: an apply on that server would
+            # evaluate the edit a second time, so it restarts too.
             same_image = get(session, "image", "whole") == string(image) &&
                          get(session, "delta_opt", -1) == delta_opt &&
                          (image != :overlay || session["base"] == snapshots[1]["id"]) &&
                          get(session, "harness", "") == _reactive_harness_print(_reactive_harness_dir())
-            if saves < max_saves && rss_kb < max_rss_kb && last == snapshots[end]["id"] && same_image
+            pending = get(session, "pending", nothing)
+            if saves < max_saves && rss_kb < max_rss_kb && last == snapshots[end]["id"] && same_image && pending === nothing
                 return session
             end
-            @info "materialize_app: the server restarts" saves rss_kb last latest = snapshots[end]["id"]
+            @info "materialize_app: the server restarts" saves rss_kb last latest = snapshots[end]["id"] pending
             _reactive_request(session["socket"], "quit"; quiet = true)
             quitting = true
         else
@@ -1008,11 +1092,19 @@ function _reactive_server_ensure(app_dir, store, config, snapshots, image = :who
                                 "image" => string(image), "delta_opt" => delta_opt,
                                 "harness" => _reactive_harness_print(_reactive_harness_dir()),
                                 "started" => Libc.strftime("%Y-%m-%d %H:%M:%S", time()))
-    open(session_file, "w") do io
-        TOML.print(io, session)
-    end
+    _reactive_write_session(store, session)
     @info "materialize_app: the server started" pid = session["pid"] base
     return session
+end
+
+# Write the session file of the server of the store. The file is complete at
+# each moment: the text goes to a file beside it, which then takes its name.
+function _reactive_write_session(store, session)
+    session_file = _reactive_server_session(store)
+    draft = session_file * ".draft"
+    open(io -> TOML.print(io, session), draft, "w")
+    mv(draft, session_file; force = true)
+    return nothing
 end
 
 # ── the trimmed product ─────────────────────────────────────────────────────
