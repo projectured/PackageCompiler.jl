@@ -163,6 +163,7 @@ function materialize_app(package_dir::String, app_dir::String;
                          compact::Tuple{Int, Float64} = _reactive_compact_env(),
                          delta_opt::Int = parse(Int, get(ENV, "JULIA_REACTIVE_DELTA_OPT", "-1")),
                          track_dependencies::Bool = false,
+                         rebuild_unchanged::Bool = get(ENV, "JULIA_REACTIVE_REBUILD_UNCHANGED", "") == "1",
                          kwargs...)
     trim in (:off, :on, :once) || error("materialize_app: `trim` is :off, :on or :once, not :", trim)
     store = _reactive_store_dir(app_dir)
@@ -170,7 +171,8 @@ function materialize_app(package_dir::String, app_dir::String;
         track_dependencies &&
             (tracked = _merge_tracked(isempty(tracked) ? tracked_sources(package_dir) : tracked,
                                       _dependency_sources(package_dir)))
-        reason = _materialize_rebuild(app_dir, store, tracked, founding, compact, server, trim, image, delta_opt)
+        reason = _materialize_rebuild(app_dir, store, tracked, founding, compact, server, trim, image, delta_opt,
+                                      rebuild_unchanged)
         reason === nothing && return app_dir
         config = TOML.parsefile(joinpath(store, REACTIVE_STORE_FILE))["config"]
         isempty(tracked) && (tracked = [String(e["file"]) => String(e["root"]) for e in config["tracked"]])
@@ -335,7 +337,7 @@ end
 # the caller of `materialize_app` passes.
 function _materialize_rebuild(app_dir::String, store::String, tracked::Vector{Pair{String, String}},
                               founding::Bool, compact::Tuple{Int, Float64}, server::Bool, trim::Symbol,
-                              image::Symbol, delta_opt::Int)
+                              image::Symbol, delta_opt::Int, rebuild_unchanged::Bool)
     image in (:whole, :pages, :overlay) || error("materialize_app: `image` is :whole, :pages or :overlay, not :", image)
     -1 <= delta_opt <= 3 || error("materialize_app: `delta_opt` is 0 to 3, or -1 for the build's level, not ", delta_opt)
     # The garbage of the log: a rebuild appends to the image and never
@@ -356,8 +358,47 @@ function _materialize_rebuild(app_dir::String, store::String, tracked::Vector{Pa
         error("materialize_app: an input of the store changed: ", join(changed, ", "),
               ". The image holds the input of its whole build, and a rebuild applies the tracked sources only. ",
               "Pass `founding = true` (the option `--found` of the build scripts) for a whole build with the input of now.")
+    # A build with no change does no work (D9): the image of the last snapshot
+    # is the image of these sources. A test that asks a server for a save with
+    # no change passes `rebuild_unchanged`.
+    if !rebuild_unchanged && (trim == :off || isdir(joinpath(app_dir, "trimmed")))
+        last = _reactive_unchanged_since(store, tracked, config)
+        if last !== nothing
+            @info "materialize_app: no tracked file, no file that they read and no statement of the trace changed since snapshot s$last; the program stays as it is"
+            return nothing
+        end
+    end
     _materialize_delta(app_dir, store, tracked; server, trim, image, delta_opt)
     return nothing
+end
+
+# The print of the trace of the store, which a snapshot records: a rebuild
+# precompiles the trace, so a new recording (`refresh_trace`) is a change.
+_reactive_trace_print(store) = (trace = _reactive_trace(store);
+                                isfile(trace) ? string(hash(read(trace, String)); base = 16) : "")
+
+# The id of the last snapshot of the store when the sources are those of it:
+# the same tracked files with the same roots and texts, each file that a
+# top-level expression of them reads with the same content, and the same
+# trace; else `nothing`. A snapshot of before the record of the trace answers
+# `nothing`.
+function _reactive_unchanged_since(store, tracked::Vector{Pair{String, String}}, config)
+    data = TOML.parsefile(joinpath(store, REACTIVE_STORE_FILE))
+    last = sort(Vector{Any}(data["snapshot"]); by = entry -> entry["id"])[end]
+    get(last, "trace", nothing) == _reactive_trace_print(store) || return nothing
+    snapshot = _reactive_snapshot_dir(store, last["id"])
+    isfile(joinpath(snapshot, "tracked.toml")) || return nothing
+    old_files, old_roots, old_copies = _reactive_read_sources(snapshot)
+    files = isempty(tracked) ? String[entry["file"] for entry in config["tracked"]] : String[abspath(file) for (file, _) in tracked]
+    roots = isempty(tracked) ? String[entry["root"] for entry in config["tracked"]] : String[root for (_, root) in tracked]
+    files == old_files && roots == old_roots || return nothing
+    for (file, copy) in zip(files, old_copies)
+        isfile(file) && isfile(copy) && read(file) == read(copy) || return nothing
+    end
+    for (path, print) in _reactive_read_reads(joinpath(snapshot, "reads.txt"))
+        isfile(path) && string(hash(read(path, String)); base = 16) == print || return nothing
+    end
+    return last["id"]
 end
 
 function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
@@ -475,8 +516,9 @@ function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
         # The image holds the harness of the Julia that builds it, whatever
         # `JULIA_REACTIVE_HARNESS` names for a rebuild.
         "harness" => _reactive_image_harness_print())
-    _reactive_save(store, Dict{String, Any}("config" => config,
-                                            "snapshot" => Any[_reactive_entry(1)]))
+    founding_entry = _reactive_entry(1)
+    founding_entry["trace"] = _reactive_trace_print(store)
+    _reactive_save(store, Dict{String, Any}("config" => config, "snapshot" => Any[founding_entry]))
     @info "materialize_app: the store is founded" store statements = length(statements)
     if trim != :off
         reason = _reactive_trim_product(app_dir, store, Any[_reactive_entry(1)], 1, 1,
@@ -767,6 +809,7 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
     config["tracked"] = [Dict{String, Any}("file" => file, "root" => root)
                          for (file, root) in zip(files, roots)]
     entry = _reactive_entry(id)
+    entry["trace"] = _reactive_trace_print(store)
     entry["base"] = base
     image == :overlay && (entry["overlay"] = overlay)
     push!(data["snapshot"], entry)
