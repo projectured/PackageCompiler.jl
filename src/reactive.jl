@@ -164,7 +164,7 @@ function materialize_app(package_dir::String, app_dir::String;
                          delta_opt::Int = parse(Int, get(ENV, "JULIA_REACTIVE_DELTA_OPT", "-1")),
                          track_dependencies::Bool = false,
                          rebuild_unchanged::Bool = get(ENV, "JULIA_REACTIVE_REBUILD_UNCHANGED", "") == "1",
-                         rebase::Float64 = parse(Float64, get(ENV, "JULIA_REACTIVE_REBASE", "0.05")),
+                         rebase::Float64 = parse(Float64, get(ENV, "JULIA_REACTIVE_REBASE", "0.02")),
                          kwargs...)
     trim in (:off, :on, :once) || error("materialize_app: `trim` is :off, :on or :once, not :", trim)
     store = _reactive_store_dir(app_dir)
@@ -374,9 +374,9 @@ function _materialize_rebuild(app_dir::String, store::String, tracked::Vector{Pa
     # D6: an overlay holds each change since its base, so each save compiles
     # them all again. Past the bound, the base moves forward.
     if image == :overlay && trim == :off
-        growth = _reactive_growth(app_dir, TOML.parsefile(joinpath(store, REACTIVE_STORE_FILE))["config"])
-        if growth >= rebase
-            @info "materialize_app: the overlay is $(round(100 * growth; digits = 1)) % of the base, the bound is $(round(100 * rebase; digits = 1)) %: the base moves forward"
+        share = _reactive_delta_share(store)
+        if share >= rebase
+            @info "materialize_app: the code of the overlay is $(round(100 * share; digits = 1)) % of the code of the base, the bound is $(round(100 * rebase; digits = 1)) %: the base moves forward"
             stop_server(app_dir)
             try
                 _materialize_delta(app_dir, store, tracked; image = :whole, delta_opt, rebase = true, keep_object_archive)
@@ -609,6 +609,21 @@ function _reactive_compact_env()
     parts = split(value, ',')
     length(parts) == 2 || error("materialize_app: JULIA_REACTIVE_COMPACT is `saves,growth`, not `", value, "`")
     return (parse(Int, strip(parts[1])), parse(Float64, strip(parts[2])))
+end
+
+# The code of the changes since the base, as a fraction of the code of the
+# base: the size of the text objects of the last snapshot, which hold each
+# function that a change compiled since the base, against those of the base,
+# the first snapshot. It grows with the edits; the size of an overlay has a
+# part that follows the base, the lists of the whole image, and is no measure
+# of what a save compiles again (D6).
+function _reactive_delta_share(store)
+    snapshots = sort(Vector{Any}(TOML.parsefile(joinpath(store, REACTIVE_STORE_FILE))["snapshot"]); by = s -> s["id"])
+    length(snapshots) < 2 && return 0.0
+    code(id) = sum(filesize, _reactive_texts(_reactive_snapshot_dir(store, id)); init = 0)
+    base = code(snapshots[1]["id"])
+    base > 0 || return 0.0
+    return code(snapshots[end]["id"]) / base
 end
 
 # The growth of the image since the founding, as a fraction of the founding's
@@ -904,7 +919,8 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
     end
     growth = round(100 * _reactive_growth(app_dir, config); digits = 2)
     lost = _reactive_count_lines(_reactive_trace(store) * ".unresolved")
-    @info (rebase ? "materialize_app: snapshot s$id is the base now" : "materialize_app: snapshot s$id materialized") seconds = round(elapsed; digits = 1) server trim image growth_percent = growth lost_statements = lost
+    code_percent = round(100 * _reactive_delta_share(store); digits = 2)
+    @info (rebase ? "materialize_app: snapshot s$id is the base now" : "materialize_app: snapshot s$id materialized") seconds = round(elapsed; digits = 1) server trim image growth_percent = growth code_percent lost_statements = lost
     _reactive_report_lost(app_dir, store, lost, get(config, "founding_lost", 0))
     return app_dir
 end
