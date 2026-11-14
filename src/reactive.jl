@@ -164,6 +164,7 @@ function materialize_app(package_dir::String, app_dir::String;
                          delta_opt::Int = parse(Int, get(ENV, "JULIA_REACTIVE_DELTA_OPT", "-1")),
                          track_dependencies::Bool = false,
                          rebuild_unchanged::Bool = get(ENV, "JULIA_REACTIVE_REBUILD_UNCHANGED", "") == "1",
+                         rebase::Float64 = parse(Float64, get(ENV, "JULIA_REACTIVE_REBASE", "0.05")),
                          kwargs...)
     trim in (:off, :on, :once) || error("materialize_app: `trim` is :off, :on or :once, not :", trim)
     store = _reactive_store_dir(app_dir)
@@ -172,7 +173,7 @@ function materialize_app(package_dir::String, app_dir::String;
             (tracked = _merge_tracked(isempty(tracked) ? tracked_sources(package_dir) : tracked,
                                       _dependency_sources(package_dir)))
         reason = _materialize_rebuild(app_dir, store, tracked, founding, compact, server, trim, image, delta_opt,
-                                      rebuild_unchanged)
+                                      rebuild_unchanged, rebase, get(kwargs, :keep_object_archive, nothing))
         reason === nothing && return app_dir
         config = TOML.parsefile(joinpath(store, REACTIVE_STORE_FILE))["config"]
         isempty(tracked) && (tracked = [String(e["file"]) => String(e["root"]) for e in config["tracked"]])
@@ -337,7 +338,8 @@ end
 # the caller of `materialize_app` passes.
 function _materialize_rebuild(app_dir::String, store::String, tracked::Vector{Pair{String, String}},
                               founding::Bool, compact::Tuple{Int, Float64}, server::Bool, trim::Symbol,
-                              image::Symbol, delta_opt::Int, rebuild_unchanged::Bool)
+                              image::Symbol, delta_opt::Int, rebuild_unchanged::Bool, rebase::Float64,
+                              keep_object_archive::Union{Nothing, String})
     image in (:whole, :pages, :overlay) || error("materialize_app: `image` is :whole, :pages or :overlay, not :", image)
     -1 <= delta_opt <= 3 || error("materialize_app: `delta_opt` is 0 to 3, or -1 for the build's level, not ", delta_opt)
     # The garbage of the log: a rebuild appends to the image and never
@@ -369,6 +371,22 @@ function _materialize_rebuild(app_dir::String, store::String, tracked::Vector{Pa
         end
     end
     _materialize_delta(app_dir, store, tracked; server, trim, image, delta_opt)
+    # D6: an overlay holds each change since its base, so each save compiles
+    # them all again. Past the bound, the base moves forward.
+    if image == :overlay && trim == :off
+        growth = _reactive_growth(app_dir, TOML.parsefile(joinpath(store, REACTIVE_STORE_FILE))["config"])
+        if growth >= rebase
+            @info "materialize_app: the overlay is $(round(100 * growth; digits = 1)) % of the base, the bound is $(round(100 * rebase; digits = 1)) %: the base moves forward"
+            stop_server(app_dir)
+            try
+                _materialize_delta(app_dir, store, tracked; image = :whole, delta_opt, rebase = true, keep_object_archive)
+            catch err
+                # The overlay of this build is in place: the program runs, and
+                # the next build tries again.
+                @warn "materialize_app: the base did not move forward; the program keeps its overlay" exception = (err, catch_backtrace())
+            end
+        end
+    end
     return nothing
 end
 
@@ -627,6 +645,37 @@ function _reactive_overlay_link(app_dir, archive, id)
     return name
 end
 
+# The chain of no overlay: the program loads its base alone.
+function _reactive_chain_clear(app_dir)
+    for replaced in _reactive_chain_read(app_dir)
+        rm(joinpath(dirname(_reactive_sysimage(app_dir)), replaced); force = true)
+    end
+    write(_reactive_chain_file(app_dir), "")
+    return nothing
+end
+
+# The text objects of a rebase (D6): the snapshot `id` holds the text objects
+# of its delta, which its image links with the text objects of the base
+# snapshot `base`. It becomes the first snapshot of the store, so it holds
+# both, the ones of the base first. Answer the archive for the program: the
+# archive of the save with the text objects of the base.
+function _reactive_rebase_texts!(store, base, id, archive)
+    snapshot = _reactive_snapshot_dir(store, id)
+    for text in _reactive_texts(snapshot)
+        mv(text, joinpath(snapshot, "text1-" * basename(text)))
+    end
+    based = String[]
+    for text in _reactive_texts(_reactive_snapshot_dir(store, base))
+        target = joinpath(snapshot, "text0-" * basename(text))
+        hardlink(text, target)
+        push!(based, target)
+    end
+    draft = joinpath(snapshot, "program.a")
+    cp(archive, draft; force = true)
+    isempty(based) || run(`ar q $draft $based`)
+    return draft
+end
+
 # Make `name` the whole chain: a writer of an overlay starts from the
 # founding image, so its overlay holds every change since the founding. The
 # overlays it replaces go.
@@ -658,13 +707,16 @@ function _reactive_compact_reason(app_dir, store, founding, compact, image)
     saves = length(data["snapshot"]) - 1
     image != :overlay && saves >= compact[1] &&
         return "$saves saves since the founding, the bound is $(compact[1])"
+    # An overlay store moves its base forward instead (D6, `rebase`).
+    image == :overlay && return nothing
     growth = _reactive_growth(app_dir, data["config"]::Dict{String, Any})
     growth >= compact[2] && return "the image grew $(round(100 * growth; digits = 1)) % since the founding, the bound is $(round(100 * compact[2]; digits = 1)) %"
     return nothing
 end
 
 function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim::Symbol = :off,
-                            image::Symbol = :whole, delta_opt::Int = -1)
+                            image::Symbol = :whole, delta_opt::Int = -1, rebase::Bool = false,
+                            keep_object_archive::Union{Nothing, String} = nothing)
     data = TOML.parsefile(joinpath(store, REACTIVE_STORE_FILE))
     config = data["config"]::Dict{String, Any}
     snapshots = sort(Vector{Any}(data["snapshot"]); by = s -> s["id"])
@@ -674,7 +726,9 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
     # sources are the old side of the edit. A server's is its last save. An
     # overlay child loads the founding image: its overlay holds every change
     # since the founding, and it is the whole chain.
-    start = session !== nothing ? session["last"] : image == :overlay ? snapshots[1]["id"] : snapshots[end]["id"]
+    # A rebase (D6) is a child in the whole form from the base image, the
+    # first snapshot, which applies each change since it.
+    start = session !== nothing ? session["last"] : image == :overlay || rebase ? snapshots[1]["id"] : snapshots[end]["id"]
     parent = _reactive_snapshot_dir(store, start)
     snapshot = _reactive_snapshot_dir(store, id)
     mkpath(snapshot)
@@ -753,7 +807,7 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
                             sysimage_path = next_sysimage,
                             project = config["package_dir"],
                             incremental = true,
-                            base_sysimage = image == :overlay ? _reactive_founding_image(app_dir, store) : sysimage,
+                            base_sysimage = image == :overlay || rebase ? _reactive_founding_image(app_dir, store) : sysimage,
                             cpu_target = config["cpu_target"],
                             script,
                             sysimage_build_args = Cmd(vcat(String.(config["sysimage_build_args"]),
@@ -799,6 +853,9 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
             error("materialize_app: the rebuild is refused (T1); the trimmer names the call sites:\n", reason)
         end
     end
+    # The work of a rebase that can fail comes before its image takes the
+    # place of the base.
+    rebase_archive = rebase ? _reactive_rebase_texts!(store, snapshots[1]["id"], id, archive) : nothing
     if image == :overlay
         _reactive_chain_replace(app_dir, overlay)
     else
@@ -821,7 +878,24 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
         end
         data["snapshot"] = Any[snapshots[1], entry]
     end
+    if rebase
+        # The image of this snapshot is the base now: the store starts over
+        # from it, as from a founding, with an empty chain.
+        delete!(entry, "base")
+        for earlier in snapshots
+            rm(_reactive_snapshot_dir(store, earlier["id"]); recursive = true, force = true)
+        end
+        data["snapshot"] = Any[entry]
+        config["founding_size"] = filesize(sysimage)
+        _reactive_chain_clear(app_dir)
+    end
     _reactive_save(store, data)
+    # The archive of the program last: the builder links the program again
+    # when it is new, and the store names the new base now.
+    if rebase_archive !== nothing
+        keep_object_archive === nothing ? rm(rebase_archive; force = true) :
+            mv(rebase_archive, keep_object_archive; force = true)
+    end
     if server
         # The server's state is this snapshot now, and the store names it.
         session["last"] = id
@@ -830,7 +904,7 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
     end
     growth = round(100 * _reactive_growth(app_dir, config); digits = 2)
     lost = _reactive_count_lines(_reactive_trace(store) * ".unresolved")
-    @info "materialize_app: snapshot s$id materialized" seconds = round(elapsed; digits = 1) server trim image growth_percent = growth lost_statements = lost
+    @info (rebase ? "materialize_app: snapshot s$id is the base now" : "materialize_app: snapshot s$id materialized") seconds = round(elapsed; digits = 1) server trim image growth_percent = growth lost_statements = lost
     _reactive_report_lost(app_dir, store, lost, get(config, "founding_lost", 0))
     return app_dir
 end
