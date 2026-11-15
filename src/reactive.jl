@@ -414,7 +414,7 @@ function _reactive_unchanged_since(store, tracked::Vector{Pair{String, String}},
         isfile(file) && isfile(copy) && read(file) == read(copy) || return nothing
     end
     for (path, print) in _reactive_read_reads(joinpath(snapshot, "reads.txt"))
-        isfile(path) && string(hash(read(path, String)); base = 16) == print || return nothing
+        _reactive_read_print(path) == print || return nothing
     end
     return last["id"]
 end
@@ -452,7 +452,6 @@ function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
     # `create_app` clears `app_dir`, so the copy waits outside it.
     early = mktempdir()
     _reactive_copy_sources(files, roots, early)
-    _reactive_write_reads(files, early)
     statements_files = String[abspath(file) for file in precompile_statements_file]
     inputs = _reactive_inputs(package_dir, workload === nothing ? "" : abspath(workload), statements_files)
     base_sysimage = unsafe_string(Base.JLOptions().image_file)
@@ -476,8 +475,15 @@ function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
     # image holds the harness's cache of the resolved statements: a server
     # that starts from the founding image precompiles the trace by lookups,
     # with no parse and no evaluation of each statement.
+    # Before that, the script writes the files that the load of each package
+    # read. The process of the build loads a package from its cache file, so
+    # it takes them from the listing beside each cache file, which the
+    # process that made the cache file wrote.
     harness_script = tempname() * "-founding.jl"
-    write(harness_script, "Base.require(Base.PkgId(Base.UUID($(repr(string(REACTIVE_COMPILER_UUID)))), \"ReactiveCompiler\")).rc_precompile_trace($(repr(trace)))\n")
+    loaded_reads = tempname() * "-reads.txt"
+    harness = "Base.require(Base.PkgId(Base.UUID($(repr(string(REACTIVE_COMPILER_UUID)))), \"ReactiveCompiler\"))"
+    write(harness_script, "$harness.rc_write_loaded_reads($(repr(loaded_reads)))\n" *
+                          "$harness.rc_precompile_trace($(repr(trace)))\n")
     # Incremental: the app image grows from the image of this process, the
     # one the trace ran from. The image is written in the reactive format: a
     # rebuild reuses its functions by id and by name, and the link drops the
@@ -510,6 +516,10 @@ function _materialize_full(package_dir, app_dir, store; trim::Symbol = :off,
         mv(joinpath(early, name), joinpath(snapshot, name); force = true)
     end
     rm(early; recursive = true, force = true)
+    # The reads of the build: those of the tracked sources among the reads of
+    # the packages that the build loaded.
+    _reactive_compiler().rc_found_reads(loaded_reads, files, joinpath(snapshot, "reads.txt"))
+    rm(loaded_reads; force = true)
     # The files that the image holds and that no rebuild reads are inputs,
     # with the print of the text that the build loaded.
     untracked = _reactive_untracked_sources(app_dir, package_dir, files)
@@ -758,7 +768,6 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
     # that arrives during the rebuild is then a change for the next one. A
     # copy taken after it would hold a text that the image does not.
     _reactive_copy_sources(files, roots, snapshot)
-    old_reads = _reactive_read_reads(joinpath(parent, "reads.txt"))
     reads = joinpath(snapshot, "reads.txt")
     refusal = joinpath(snapshot, "refusal.txt")
     trace = _reactive_trace(store)
@@ -766,7 +775,8 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
     script = joinpath(snapshot, "child.jl")
     trimmed_archive = joinpath(snapshot, "trimmed.a")
     write(script, _reactive_child_script(old_files, _reactive_paths(old_roots), old_copies,
-                                         files, _reactive_paths(roots), old_reads, reads, refusal, trace;
+                                         files, _reactive_paths(roots), joinpath(parent, "reads.txt"), reads,
+                                         refusal, trace;
                                          trim = !server && trim != :off, trimmed = trimmed_archive,
                                          overrides = _reactive_trim_overrides(),
                                          harness = _reactive_live_harness(config)))
@@ -945,7 +955,7 @@ _reactive_paths(roots) = Vector{Symbol}[isempty(root) ? Symbol[] : Symbol.(split
 
 # The top level of the rebuild child. Everything that varies is a literal
 # here; the function bodies are the stdlib's, compiled in the image.
-function _reactive_child_script(old_files, old_roots, old_copies, files, roots, old_reads,
+function _reactive_child_script(old_files, old_roots, old_copies, files, roots, old_listing,
                                 reads, refusal, trace; trim::Bool = false, trimmed = "", overrides = "",
                                 harness = nothing)
     io = IOBuffer()
@@ -955,7 +965,7 @@ function _reactive_child_script(old_files, old_roots, old_copies, files, roots, 
     println(io, "rc_state = try")
     println(io, "    $rc.rc_apply_tracked($(repr(old_files)), $(repr(old_roots)), $(repr(old_copies)),")
     println(io, "                     $(repr(files)), $(repr(roots)),")
-    println(io, "                     $(repr(old_reads)), $(repr(reads)), $(repr(refusal)))")
+    println(io, "                     $(repr(old_listing)), $(repr(reads)), $(repr(refusal)))")
     println(io, "catch e")
     println(io, "    e isa $rc.RcRefusal || rethrow()")
     println(io, "    exit(3)")
@@ -1017,38 +1027,24 @@ function _reactive_server_script(harness::AbstractString, socket::AbstractString
     return String(take!(io))
 end
 
-# The files that a top-level expression of a tracked file can read, with the
-# hash of their content, as `<hash> <path>` lines: the child compares them
-# with the files of the next rebuild. The founding writes the listing the
-# way the child does.
-function _reactive_write_reads(files, snapshot)
-    reads = Tuple{String, String}[]
-    for file in files
-        diff = _reactive_compiler().ReactiveSourceDiff
-        for entry in diff.file_entries(read(file, String), file)
-            for path in diff.read_paths(entry.expr, dirname(file))
-                push!(reads, (path, string(hash(read(path, String)); base = 16)))
-            end
-        end
-    end
-    unique!(reads)
-    open(joinpath(snapshot, "reads.txt"), "w") do io
-        for (path, h) in reads
-            println(io, h, " ", path)
-        end
-    end
-    return nothing
-end
-
+# The files that the top-level expressions of the tracked sources read, each
+# with the print of its content, from the listing that the harness writes for
+# a snapshot (`rc_write_reads`): a line holds the print, the line and the
+# source file of the expression, and the path, with a tab between them.
 function _reactive_read_reads(listing)
     reads = Tuple{String, String}[]
     isfile(listing) || return reads
     for line in eachline(listing)
-        parts = split(line, " "; limit = 2)
-        length(parts) == 2 && push!(reads, (String(parts[2]), String(parts[1])))
+        parts = split(line, '\t')
+        length(parts) == 4 && push!(reads, (String(parts[4]), String(parts[1])))
     end
     return reads
 end
+
+# The print of the content of a read file now, as the harness takes it
+# (`rc_read_changed`). The print of a file that changed while its reader was
+# evaluated equals none.
+_reactive_read_print(path) = isfile(path) ? string(hash(read(path, String)); base = 16) : "absent"
 
 # The text objects of the archive, extracted into the snapshot; the heap and
 # the tables of an old build are never linked again.
