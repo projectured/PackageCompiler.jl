@@ -82,6 +82,54 @@ _reactive_snapshot_dir(store, id) = joinpath(store, "s$id")
 _reactive_sysimage(app_dir) = joinpath(abspath(app_dir), "lib", "julia", "sys." * Libdl.dlext)
 _reactive_trace(store) = joinpath(store, REACTIVE_TRACE_FILE)
 
+# The record of the builds of a store: one line for each build, which the
+# build appends at its end. The fields of a line have a tab between them: the
+# time, the kind, and then fields of the form `name=value`. The kinds:
+#   whole     a whole build made the store: cause, seconds, statements,
+#             image_bytes
+#   rebuild   a rebuild made a snapshot: snapshot, form, seconds, changes,
+#             overlay_bytes, code_percent, growth_percent, lost
+#   base      the base of an overlay store moved forward: as a rebuild
+#   refused   the apply refused the edit: reasons
+#   stopped   an input of the store changed: inputs
+#   recorded  `refresh_trace` recorded the workload again: statements, kept,
+#             dropped, added
+# A build with no change and a build that fails have no line. A whole build
+# takes the record of the store that it replaces.
+const REACTIVE_RECORD_FILE = "builds.txt"
+_reactive_record(store) = joinpath(store, REACTIVE_RECORD_FILE)
+
+function _reactive_record!(store, kind::String, fields::Pair{String}...)
+    clean(value) = replace(string(value), r"[\t\r\n]+" => " ")
+    line = String[Libc.strftime("%Y-%m-%d %H:%M:%S", time()), kind]
+    for (name, value) in fields
+        push!(line, string(name, "=", clean(value)))
+    end
+    open(_reactive_record(store), "a") do io
+        println(io, join(line, '\t'))
+    end
+    return nothing
+end
+
+# The count of the changes of each id of the change catalog in the apply of a
+# snapshot, as `A2:14,C1:3`, from the listing that the harness writes beside
+# the read listing. An apply of a harness with no such listing has no counts.
+# The apply of a child of an overlay store holds each change since the base.
+function _reactive_change_counts(snapshot)
+    listing = joinpath(snapshot, "changes.txt")
+    isfile(listing) || return ""
+    counts = Dict{String, Int}()
+    for line in eachline(listing)
+        isempty(line) && continue
+        id = String(first(split(line, '\t')))
+        counts[id] = get(counts, id, 0) + 1
+    end
+    return join(("$id:$(counts[id])" for id in sort!(collect(keys(counts)))), ",")
+end
+
+# The reasons of a refusal on one line.
+_reactive_reasons_line(reasons) = join(filter(!isempty, strip.(split(reasons, '\n'))), " | ")
+
 """
     materialize_app(package_dir, app_dir; tracked, workload = nothing, kwargs...)
 
@@ -168,6 +216,7 @@ function materialize_app(package_dir::String, app_dir::String;
                          kwargs...)
     trim in (:off, :on, :once) || error("materialize_app: `trim` is :off, :on or :once, not :", trim)
     store = _reactive_store_dir(app_dir)
+    cause = "no store"
     if isfile(joinpath(store, REACTIVE_STORE_FILE)) && isfile(_reactive_sysimage(app_dir))
         track_dependencies &&
             (tracked = _merge_tracked(isempty(tracked) ? tracked_sources(package_dir) : tracked,
@@ -179,6 +228,7 @@ function materialize_app(package_dir::String, app_dir::String;
         isempty(tracked) && (tracked = [String(e["file"]) => String(e["root"]) for e in config["tracked"]])
         workload === nothing && !isempty(get(config, "workload", "")) && (workload = String(config["workload"]))
         @info "materialize_app: the store founds again" reason
+        cause = reason
         stop_server(app_dir)
     end
     # The tracked files of a founding: the includes of the package's root
@@ -197,10 +247,18 @@ function materialize_app(package_dir::String, app_dir::String;
     rm(staging; recursive = true, force = true)
     # A dynamic call: the compile of a rebuild does not infer the founding,
     # whose `create_app` is large, for the keywords of each caller.
+    started = time()
     Base.invokelatest(_materialize_full, package_dir, staging, _reactive_store_dir(staging); trim,
                       tracked, track_dependencies, workload,
                       precompile_statements_file = vcat(precompile_statements_file),
                       cpu_target, sysimage_build_args, kwargs...)
+    # The record of the builds: the new store takes the record of the store
+    # that it replaces, and the whole build adds its line with its cause.
+    new_store = _reactive_store_dir(staging)
+    isfile(_reactive_record(store)) && cp(_reactive_record(store), _reactive_record(new_store); force = true)
+    _reactive_record!(new_store, "whole", "cause" => cause, "seconds" => round(time() - started; digits = 1),
+                      "statements" => _reactive_count_lines(_reactive_trace(new_store)),
+                      "image_bytes" => filesize(_reactive_sysimage(staging)))
     old = app_dir * ".old"
     rm(old; recursive = true, force = true)
     # A rebuild during the founding can start a server of the old store; it
@@ -356,6 +414,7 @@ function _materialize_rebuild(app_dir::String, store::String, tracked::Vector{Pa
     delta_opt >= 0 && delta_opt != whole_opt &&
         @info "materialize_app: the rebuild compiles its code at another level than the whole build" rebuild = "-O$delta_opt" whole_build = "-O$whole_opt"
     changed = _reactive_changed_inputs(config)
+    isempty(changed) || _reactive_record!(store, "stopped", "inputs" => join(changed, ", "))
     isempty(changed) ||
         error("materialize_app: an input of the store changed: ", join(changed, ", "),
               ". The image holds the input of its whole build, and a rebuild applies the tracked sources only. ",
@@ -597,6 +656,8 @@ function refresh_trace(app_dir::String)
     statements = _reactive_roots(vcat(kept, new))
     write(trace, join(statements, '\n') * "\n")
     @info "refresh_trace: the trace is refreshed" statements = length(statements) kept = length(kept) dropped = length(old) - length(kept) added = length(statements) - length(kept)
+    _reactive_record!(store, "recorded", "statements" => length(statements), "kept" => length(kept),
+                      "dropped" => length(old) - length(kept), "added" => length(statements) - length(kept))
     return trace
 end
 
@@ -614,11 +675,14 @@ end
 
 _reactive_statements(file) = String[line for line in eachline(file) if startswith(line, "precompile(")]
 
-# The roots among the statements of a trace: each once, and none of `Main`.
-# A workload script runs in the Main of the trace process, so its own
-# functions and closures are traced there; no rebuild child can precompile
-# them, and the binary never calls them.
-_reactive_roots(statements) = unique!(filter(line -> !occursin(r"\bMain\.", line), statements))
+# The roots among the statements of a trace: each once, none of `Main`, and
+# none of a harness that the trace process loads from its sources. A workload
+# script runs in the Main of the trace process, so its own functions and
+# closures are traced there; no rebuild child can precompile them, and the
+# binary never calls them. A harness from its sources (`_reactive_harness_load`)
+# is compiled in the trace process too, in the module `ReactiveHarness`, and
+# it is no part of the program.
+_reactive_roots(statements) = unique!(filter(line -> !occursin(r"\b(Main|ReactiveHarness)\.", line), statements))
 
 # `JULIA_REACTIVE_COMPACT="saves,growth"`: found again after that many saves
 # or that much growth of the image since the founding.
@@ -731,9 +795,10 @@ function _reactive_founding_image(app_dir, store)
     return path
 end
 
-# Why the store founds again, or nothing. An overlay store holds one overlay
-# of every change since the founding, so its saves do not grow the image, and
-# only the growth counts.
+# Why the store founds again, or nothing: on `founding`, or past the saves or
+# the growth of `compact` for a store of the whole or the pages form. An
+# overlay store holds one overlay of every change since its base, and it does
+# not found again by itself: its base moves forward instead (`rebase`).
 function _reactive_compact_reason(app_dir, store, founding, compact, image)
     founding && return "founding = true"
     data = TOML.parsefile(joinpath(store, REACTIVE_STORE_FILE))
@@ -815,6 +880,7 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
             _reactive_write_session(store, session)
             reasons = isfile(refusal) ? read(refusal, String) : reply
             rm(snapshot; recursive = true, force = true)
+            _reactive_record!(store, "refused", "reasons" => _reactive_reasons_line(reasons))
             error("materialize_app: the rebuild is refused; a founding build applies the change:\n", reasons)
         end
         startswith(reply, "ok") || error("materialize_app: the server answered `", reply, "`; see ", joinpath(store, "server.log"))
@@ -860,6 +926,7 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
             reasons = read(refusal, String)
             rm(snapshot; recursive = true, force = true)
             rm(next_sysimage; force = true)
+            _reactive_record!(store, "refused", "reasons" => _reactive_reasons_line(reasons))
             startswith(reasons, "T1") &&
                 error("materialize_app: the rebuild is refused (T1); the trimmer names the call sites:\n", reasons)
             error("materialize_app: the rebuild is refused; a founding build applies the change:\n", reasons)
@@ -883,6 +950,7 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
             rm(snapshot; recursive = true, force = true)
             rm(next_sysimage; force = true)
             isempty(overlay) || rm(joinpath(dirname(sysimage), overlay); force = true)
+            _reactive_record!(store, "refused", "reasons" => _reactive_reasons_line(string("T1 ", reason)))
             error("materialize_app: the rebuild is refused (T1); the trimmer names the call sites:\n", reason)
         end
     end
@@ -939,6 +1007,11 @@ function _materialize_delta(app_dir, store, tracked; server::Bool = false, trim:
     lost = _reactive_count_lines(_reactive_trace(store) * ".unresolved")
     code_percent = round(100 * _reactive_delta_share(store); digits = 2)
     @info (rebase ? "materialize_app: snapshot s$id is the base now" : "materialize_app: snapshot s$id materialized") seconds = round(elapsed; digits = 1) server trim image growth_percent = growth code_percent lost_statements = lost
+    _reactive_record!(store, rebase ? "base" : "rebuild", "snapshot" => "s$id",
+                      "form" => string(server ? "server" : "child", "/", image),
+                      "seconds" => round(elapsed; digits = 1), "changes" => _reactive_change_counts(snapshot),
+                      "overlay_bytes" => (isempty(overlay) ? 0 : filesize(joinpath(dirname(sysimage), overlay))),
+                      "code_percent" => code_percent, "growth_percent" => growth, "lost" => lost)
     _reactive_report_lost(app_dir, store, lost, get(config, "founding_lost", 0))
     return app_dir
 end
@@ -1450,6 +1523,32 @@ function store_status(app_dir::String)
 end
 
 """
+    build_record(app_dir) -> Vector{NamedTuple}
+
+The record of the builds of the reactive store of `app_dir`, oldest first:
+for each build its `time`, its `kind` and its `fields`, a `Dict` from the name
+of a field to its text. The kinds are `whole`, `rebuild`, `base`, `refused`,
+`stopped` and `recorded`. A build with no change and a build that fails have
+no line. An empty list without a store or without a record.
+"""
+function build_record(app_dir::String)
+    lines = NamedTuple{(:time, :kind, :fields), Tuple{String, String, Dict{String, String}}}[]
+    record = _reactive_record(_reactive_store_dir(app_dir))
+    isfile(record) || return lines
+    for line in eachline(record)
+        parts = split(line, '\t')
+        length(parts) >= 2 || continue
+        fields = Dict{String, String}()
+        for part in parts[3:end]
+            name, value = (split(part, '='; limit = 2)..., "")[1:2]
+            fields[String(name)] = String(value)
+        end
+        push!(lines, (time = String(parts[1]), kind = String(parts[2]), fields = fields))
+    end
+    return lines
+end
+
+"""
     stop_server(app_dir)
 
 Stop the compiler server of the store of `app_dir`, if one runs.
@@ -1681,11 +1780,22 @@ end
 
 # ── the status and the watch ─────────────────────────────────────────────────
 
+# How often each text occurs in `texts`: the pairs of a text and its count,
+# the most frequent first.
+function _reactive_tally(texts::Vector{String})
+    counts = Dict{String, Int}()
+    for text in texts
+        counts[text] = get(counts, text, 0) + 1
+    end
+    return sort!(collect(counts); by = pair -> (-pair.second, pair.first))
+end
+
 """
     print_store_status(io, app_dir) -> Bool
 
 Print what the reactive store under `app_dir` holds — the founding, the
-snapshots, the chain of overlays of the bundle, the server, the growth — and
+snapshots, the chain of overlays of the bundle, the server, the growth, and
+how often each kind of build occurs in its record (`build_record`) — and
 answer whether there is one.
 """
 function print_store_status(io::IO, app_dir::AbstractString)
@@ -1709,6 +1819,25 @@ function print_store_status(io::IO, app_dir::AbstractString)
         println(io, "  server:     pid $(session["pid"]) ", session["alive"] ? "answers" : "does not answer",
                 ", started from s$(session["base"]) on $(session["started"]), last s$(get(session, "last", session["base"]))",
                 ", image $(get(session, "image", "whole"))")
+    end
+    # How often each kind of build occurs, with the causes of the whole
+    # builds, the ids of the refusals and the inputs of the stops.
+    record = build_record(String(app_dir))
+    if !isempty(record)
+        count_of(kind) = count(line -> line.kind == kind, record)
+        kinds = String["whole", "rebuild", "base", "refused", "stopped", "recorded"]
+        println(io, "  builds:     ", join(("$(count_of(kind)) $kind" for kind in kinds), ", "), ", since ", first(record).time)
+        for (cause, n) in _reactive_tally(String[get(line.fields, "cause", "") for line in record if line.kind == "whole"])
+            println(io, "    whole build, $n times: ", cause)
+        end
+        ids = String[String(first(split(reason, ' '))) for line in record if line.kind == "refused"
+                     for reason in split(get(line.fields, "reasons", ""), " | ") if !isempty(reason)]
+        for (id, n) in _reactive_tally(ids)
+            println(io, "    refused, $n times: ", id)
+        end
+        for (inputs, n) in _reactive_tally(String[get(line.fields, "inputs", "") for line in record if line.kind == "stopped"])
+            println(io, "    stopped, $n times: ", inputs)
+        end
     end
     return true
 end
